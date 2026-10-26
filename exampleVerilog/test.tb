@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module test;
+module test_tb;
 
 reg clk;
     reg rst;
@@ -15,7 +15,7 @@ wire [7:0] data_out;
     wire [3:0] counter;
     wire overflow;
 
-complex_design uut (
+test_v uut (
         .clk(clk),
         .rst(rst),
         .enable(enable),
@@ -39,7 +39,7 @@ initial begin
         data_in = 0;
 
 $dumpfile("complex.vcd");
-        $dumpvars(0, complex_tb);
+        $dumpvars(0, test_tb);
 
         $display("Time  rst en mode data_in state counter accum out valid overflow");
 
