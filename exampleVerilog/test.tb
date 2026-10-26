@@ -1,0 +1,90 @@
+`timescale 1ns / 1ps
+
+module complex_tb;
+
+reg clk;
+    reg rst;
+    reg enable;
+    reg [1:0] mode;
+    reg [7:0] data_in;
+
+wire [7:0] data_out;
+    wire valid;
+    wire [3:0] state;
+    wire [7:0] accumulator;
+    wire [3:0] counter;
+    wire overflow;
+
+complex_design uut (
+        .clk(clk),
+        .rst(rst),
+        .enable(enable),
+        .mode(mode),
+        .data_in(data_in),
+        .data_out(data_out),
+        .valid(valid),
+        .state(state),
+        .accumulator(accumulator),
+        .counter(counter),
+        .overflow(overflow)
+    );
+
+    always #5 clk = ~clk;
+
+initial begin
+        clk = 0;
+        rst = 1;
+        enable = 0;
+        mode = 0;
+        data_in = 0;
+
+$dumpfile("complex.vcd");
+        $dumpvars(0, complex_tb);
+
+        $display("Time  rst en mode data_in state counter accum out valid overflow");
+
+#12 rst = 0;
+        enable = 1;
+
+// Addition operations
+        mode = 0;
+        data_in = 8'd20;
+        #40 data_in = 8'd50;
+        #40 data_in = 8'd100;
+
+// Subtraction operations
+        #10 mode = 1;
+        data_in = 8'd15;
+        #40 data_in = 8'd3;
+
+// XOR operations
+        #10 mode = 2;
+        data_in = 8'hAA;
+        #40 data_in = 8'h55;
+
+// Shift-left operations
+        #10 mode = 3;
+        data_in = 8'h81;
+        #40 data_in = 8'h7F;
+
+// Stall the state machine
+        #10 enable = 0;
+        #30 enable = 1;
+        data_in = 8'hFE;
+
+// Another reset during activity
+        #45 rst = 1;
+        #10 rst = 0;
+        data_in = 8'h33;
+        mode = 0;
+
+#100 $finish;
+    end
+
+initial begin
+        $monitor("%4t    %b   %b  %b    %h      %d      %d     %h   %h    %b     %b",
+            $time, rst, enable, mode, data_in,
+            state, counter, accumulator, data_out, valid, overflow);
+    end
+
+endmodule
