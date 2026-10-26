@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module complex_design (
+module test (
     input wire clk,
     input wire rst,
     input wire enable,
