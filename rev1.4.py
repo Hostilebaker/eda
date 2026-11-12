@@ -564,25 +564,12 @@ class eda(tk.Tk):
                 instantiated.add(name)
         tops = [name for name in modules if name not in instantiated]
         return tops or modules
-    def find_graphviz_executable(self):
-        """Find Graphviz dot.exe in EDA2 dependencies or on PATH."""
-        executable_name = "dot.exe" if os.name == "nt" else "dot"
-        if self.dependencies_dir.is_dir():
-            for current_root, _, filenames in os.walk(self.dependencies_dir):
-                for filename in filenames:
-                    if filename.casefold() == executable_name.casefold():
-                        candidate = Path(current_root) / filename
-                        if candidate.is_file():
-                            return candidate
-        located = shutil.which(executable_name)
-        return Path(located) if located else None
-
     def run_yosys(self):
         if self.project_dir is None:
             messagebox.showwarning("no project", "Create or open an EDA2 project first.")
             return
         if self.yosys_running:
-            messagebox.showinfo("synthesis running", "Yosys/Graphviz is already running for this project.")
+            messagebox.showinfo("synthesis running", "Yosys synthesis is already running for this project.")
             return
 
         vcode = self.verilog_editor.get("1.0", "end-1c").strip()
@@ -632,20 +619,6 @@ class eda(tk.Tk):
             messagebox.showerror("Yosys executable not found", f"Could not find yosys.exe at {yosys_exe}")
             return
 
-        dot_exe = self.find_graphviz_executable()
-        if dot_exe is None:
-            selected = filedialog.askopenfilename(
-                title="Locate Graphviz dot.exe", initialdir=str(self.dependencies_dir),
-                filetypes=[("Graphviz dot executable", "dot.exe"), ("Executable files", "*.exe"), ("All files", "*.*")]
-            )
-            if not selected:
-                self.consoleprint("Synthesis cancelled: Graphviz dot.exe was not selected.\n")
-                return
-            dot_exe = Path(selected).resolve()
-            if dot_exe.name.casefold() not in ("dot.exe", "dot"):
-                messagebox.showerror("invalid Graphviz executable", "Select Graphviz dot.exe, not another executable.")
-                return
-
         self.sync_editors_to_project()
         project_dir = self.project_dir
         source_path = project_dir / "verilog" / "design.v"
@@ -655,8 +628,7 @@ class eda(tk.Tk):
         schematic_dir.mkdir(parents=True, exist_ok=True)
         netlist_path = output_dir / "synthesized.v"
         script_path = output_dir / "run_synthesis.ys"
-        dot_path = schematic_dir / "schematic.dot"
-        svg_path = schematic_dir / "schematic.svg"
+        json_path = output_dir / "synthesized.json"
 
         def yosys_path(path):
             return path.resolve().as_posix().replace('"', '\\"')
@@ -667,7 +639,7 @@ class eda(tk.Tk):
             f'synth -top {top}\n'
             'stat\n'
             f'write_verilog -noattr "{yosys_path(netlist_path)}"\n'
-            f'show -format dot -prefix schematic {top}\n'
+            f'write_json "{yosys_path(json_path)}"\n'
         )
         try:
             script_path.write_text(yosys_script, encoding="utf-8")
@@ -689,8 +661,8 @@ class eda(tk.Tk):
                 yosys_command = [str(yosys_exe), "-s", str(script_path)]
 
             self.yosys_running = True
-            self.consoleprint(f"Starting Yosys in background for top module: {top}\n")
-            self.consoleprint("EDA2 remains usable while synthesis and Graphviz run.\n")
+            self.consoleprint(f"Starting Yosys synthesis in background for top module: {top}\n")
+            self.consoleprint("EDA2 remains usable while Yosys synthesis runs.\n")
             self.consoleprint(f"Yosys script: {script_path}\n")
 
             def worker():
@@ -706,20 +678,11 @@ class eda(tk.Tk):
                     if not netlist_path.is_file():
                         self.yosys_queue.put(("done", False, "Yosys returned success but synthesized.v is missing."))
                         return
-                    if not dot_path.is_file():
-                        self.yosys_queue.put(("done", False, "Yosys returned success but schematic.dot is missing."))
+                    if not json_path.is_file():
+                        self.yosys_queue.put(("done", False, "Yosys returned success but synthesized.json is missing."))
                         return
 
-                    self.yosys_queue.put(("stage", "Graphviz is rendering schematic.svg..."))
-                    dot_result = subprocess.run(
-                        [str(dot_exe), "-Tsvg", str(dot_path), "-o", str(svg_path)],
-                        cwd=schematic_dir, env=env, capture_output=True, text=True
-                    )
-                    self.yosys_queue.put(("graphviz", dot_result.stdout, dot_result.stderr, dot_result.returncode))
-                    if dot_result.returncode != 0 or not svg_path.is_file():
-                        self.yosys_queue.put(("done", False, f"Graphviz failed (exit code {dot_result.returncode}); inspect its output above."))
-                        return
-                    self.yosys_queue.put(("done", True, "Synthesis, netlist export, DOT export and SVG rendering completed."))
+                    self.yosys_queue.put(("done", True, "Synthesis completed. Verilog netlist and machine-readable JSON netlist generated; SVG rendering is disabled."))
                 except Exception as exc:
                     self.yosys_queue.put(("done", False, f"Background synthesis error: {exc}"))
 
@@ -727,23 +690,21 @@ class eda(tk.Tk):
             self.after(100, self.poll_yosys_queue)
         except OSError as exc:
             self.yosys_running = False
-            self.consoleprint(f"could not start Yosys/Graphviz: {exc}\n")
+            self.consoleprint(f"could not start Yosys: {exc}\n")
 
     def poll_yosys_queue(self):
         """Transfer background-process output to Tkinter on the GUI thread."""
         try:
             while True:
                 item = self.yosys_queue.get_nowait()
-                if item[0] in ("yosys", "graphviz"):
+                if item[0] == "yosys":
                     stage, stdout, stderr, returncode = item
                     if stdout:
                         self.consoleprint(stdout)
                     if stderr:
                         self.consoleprint(stderr)
                     if stage == "yosys" and returncode == 0:
-                        self.consoleprint("Yosys completed: synthesized.v and schematic.dot generated.\n")
-                    elif stage == "graphviz" and returncode == 0:
-                        self.consoleprint("Graphviz completed: schematic.svg generated.\n")
+                        self.consoleprint("Yosys completed: synthesized.v and synthesized.json generated.\n")
                 elif item[0] == "stage":
                     self.consoleprint(item[1] + "\n")
                 elif item[0] == "done":
@@ -751,7 +712,7 @@ class eda(tk.Tk):
                     self.yosys_running = False
                     self.consoleprint(detail + "\n")
                     if success:
-                        self.consoleprint("Outputs: synthesis/synthesized.v, schematic/schematic.dot, schematic/schematic.svg\n")
+                        self.consoleprint("Outputs: synthesis/synthesized.v, synthesis/synthesized.json\n")
                         try:
                             self.pack_project()
                         except OSError as exc:
