@@ -43,9 +43,10 @@ class eda(tk.Tk):
         self.projects_dir = self.app_dir / "projects"
         self.dependencies_dir.mkdir(parents=True, exist_ok=True)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.settings_path = self.app_dir / "settings.json"
         self.project_dir = None
         self.waveform_path = None
-        self.gtkwave_path = None
+        self.gtkwave_path = self.load_gtkwave_path()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         # Tool locations are resolved from the EDA2 dependencies folder or the
         # user's existing Desktop installation. No shell command is built from paths.
@@ -427,24 +428,97 @@ class eda(tk.Tk):
         except OSError as e:
             self.consoleprint(f"could not execute {command[0]}: {e}\n")
             return subprocess.CompletedProcess(command, returncode=1, stdout="", stderr="")
+    def load_gtkwave_path(self):
+        """Load the previously selected GTKWave executable, if it still exists."""
+        try:
+            if self.settings_path.is_file():
+                settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                saved_path = settings.get("gtkwave_path")
+                if saved_path:
+                    executable = Path(saved_path)
+                    if executable.is_file():
+                        return executable
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def save_gtkwave_path(self):
+        """Remember the selected GTKWave executable for future EDA2 launches."""
+        try:
+            settings = {}
+            if self.settings_path.is_file():
+                try:
+                    settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    settings = {}
+            settings["gtkwave_path"] = str(self.gtkwave_path) if self.gtkwave_path else ""
+            self.settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        except OSError as e:
+            self.consoleprint(f"could not save GTKWave location: {e}\\n")
+
     def find_gtkwave_executable(self):
-        """Find GTKWave in EDA2's shared dependencies before checking PATH."""
-        executable = "gtkwave.exe" if os.name == "nt" else "gtkwave"
-        search_roots = (
-            self.dependencies_dir / "gtkwave",
-            self.dependencies_dir,
-        )
-        for root in search_roots:
-            if not root.is_dir():
-                continue
-            direct = root / executable
-            if direct.is_file():
-                return direct
-            for candidate in root.rglob(executable):
-                if candidate.is_file():
-                    return candidate
-        located = shutil.which("gtkwave")
+        """Find GTKWave anywhere inside EDA2/dependencies, then check PATH."""
+        executable_name = "gtkwave.exe" if os.name == "nt" else "gtkwave"
+
+        # Search the complete dependencies tree. GTKWave archives often contain
+        # several nested folders, e.g. gtkwave/gtkwave64/bin/gtkwave.exe.
+        if self.dependencies_dir.is_dir():
+            for current_root, _, filenames in os.walk(self.dependencies_dir):
+                for filename in filenames:
+                    if filename.casefold() == executable_name.casefold():
+                        candidate = Path(current_root) / filename
+                        if candidate.is_file():
+                            return candidate
+
+        located = shutil.which("gtkwave.exe" if os.name == "nt" else "gtkwave")
         return Path(located) if located else None
+
+    def launch_gtkwave(self, waveform):
+        """Launch GTKWave with its own folder on PATH so bundled DLLs can be found."""
+        if self.gtkwave_path is None or not self.gtkwave_path.is_file():
+            self.gtkwave_path = self.find_gtkwave_executable()
+
+        if self.gtkwave_path is None:
+            executable = filedialog.askopenfilename(
+                title="select GTKWave executable",
+                initialdir=str(self.dependencies_dir),
+                filetypes=[
+                    ("GTKWave executable", "gtkwave.exe"),
+                    ("Executable files", "*.exe"),
+                    ("All Files", "*.*")
+                ]
+            )
+            if not executable:
+                self.consoleprint("GTKWave executable was not selected\\n")
+                return False
+
+            selected_path = Path(executable).resolve()
+            if selected_path.name.casefold() not in ("gtkwave.exe", "gtkwave"):
+                messagebox.showerror(
+                    "invalid GTKWave executable",
+                    "Please select gtkwave.exe, not a shortcut or another executable."
+                )
+                return False
+
+            self.gtkwave_path = selected_path
+            self.save_gtkwave_path()
+
+        env = os.environ.copy()
+        executable_dir = str(self.gtkwave_path.parent)
+        env["PATH"] = executable_dir + os.pathsep + env.get("PATH", "")
+
+        try:
+            subprocess.Popen(
+                [str(self.gtkwave_path), str(waveform)],
+                cwd=executable_dir,
+                env=env
+            )
+            self.consoleprint(f"opened waveform {waveform} with {self.gtkwave_path}\\n")
+            return True
+        except OSError as e:
+            messagebox.showerror("GTKWave launch failed", str(e))
+            self.consoleprint(f"GTKWave launch failed: {e}\\n")
+            return False
 
     def open_waveform(self):
         # Use the latest generated waveform by default; allow selecting another VCD if needed.
@@ -459,32 +533,9 @@ class eda(tk.Tk):
             if not filepath:
                 return
             waveform = Path(filepath)
-        if self.gtkwave_path is None:
-            self.gtkwave_path = self.find_gtkwave_executable()
-        command = [str(self.gtkwave_path), str(waveform)] if self.gtkwave_path else ["gtkwave", str(waveform)]
-        try:
-            subprocess.Popen(command)
-            self.consoleprint(f"opened waveform {waveform}\n")
-        except FileNotFoundError:
-            messagebox.showinfo(
-                "gtkwave executable not found",
-                "could not find GTKWave on PATH. select gtkwave.exe in the dialog."
-            )
-            executable = filedialog.askopenfilename(
-                title="locate gtkwave.exe",
-                filetypes=[("GTKWave executable", "gtkwave.exe"), ("Executable files", "*.exe"), ("All Files", "*.*")]
-            )
-            if not executable:
-                self.consoleprint("gtkwave executable was not selected\n")
-                return
-            self.gtkwave_path = Path(executable)
-            try:
-                subprocess.Popen([str(self.gtkwave_path), str(waveform)])
-                self.consoleprint(f"opened waveform {waveform}\n")
-            except OSError as e:
-                messagebox.showerror("gtkwave launch failed", str(e))
-        except OSError as e:
-            messagebox.showerror("gtkwave launch failed", str(e))
+
+        self.launch_gtkwave(waveform)
+
     def processoutput(self, result):
         if result.stdout:
             self.consoleprint(result.stdout)
