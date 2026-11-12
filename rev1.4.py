@@ -23,7 +23,7 @@
 import json, os, re, shutil, subprocess, tempfile, tkinter as tk, zipfile, threading, queue
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
-title = "integrated asic platform rev1.4 (12/11/2026)"
+title = "integrated asic platform rev1.21 (13/11/2026)"
 filetype = ".eda2" # fix this in later revs, might get confused
 var1 = " "
 var2 = " "
@@ -780,7 +780,7 @@ class eda(tk.Tk):
         self.generate_hierarchical_rtl_schematic()
 
     def build_hierarchical_rtl_dot(self, json_path, top):
-        """Build a readable module-level overview directly from Yosys RTL JSON."""
+        """Build a conventional RTL block diagram with named port anchors."""
         data = json.loads(json_path.read_text(encoding="utf-8"))
         modules = data.get("modules", {})
         if top not in modules:
@@ -791,107 +791,183 @@ class eda(tk.Tk):
         instances = {}
         primitive_cells = []
         for cell_name, cell in cells.items():
-            cell_type = cell.get("type", "")
-            if cell_type in module_names:
+            if cell.get("type") in module_names:
                 instances[cell_name] = cell
             else:
                 primitive_cells.append((cell_name, cell))
 
         def esc(value):
-            return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+            return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;").replace('"', "&quot;"))
+
+        def ident(value):
+            return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", str(value))
+
+        def port_ident(value):
+            return "p_" + re.sub(r"[^A-Za-z0-9_]", "_", str(value))
+
+        def signal_color(name):
+            # Monochrome engineering schematic: all nets use black strokes.
+            return "#000000"
 
         lines = [
-            'digraph RTL {',
-            '  graph [rankdir=LR, bgcolor="white", pad="0.35", nodesep="0.55", ranksep="1.0", splines=polyline, overlap=false, fontname="Arial", label="' + esc(top) + '", labelloc=t, fontsize=20];',
-            '  node [shape=plain, fontname="Arial"];',
-            '  edge [fontname="Arial", fontsize=9, color="#555555", arrowsize=0.7];'
+            "digraph RTL {",
+            '  graph [rankdir=LR, bgcolor="white", pad="0.30", nodesep="0.48", ranksep="0.90", '
+            'splines=ortho, concentrate=true, overlap=false, outputorder=edgesfirst, fontname="Arial", '
+            f'label="{esc(top)}", labelloc=t, fontsize=18];',
+            '  node [shape=plain, fontname="Arial", fontsize=10];',
+            '  edge [fontname="Arial", fontsize=9, arrowsize=0.65, penwidth=1.25];'
         ]
 
-        # External interface nodes.
-        port_bits = {}
+        # External interface is kept on the left/right edges of the drawing.
+        top_ports = {}
+        input_nodes, output_nodes = [], []
         for port_name, port in module.get("ports", {}).items():
             bits = tuple(str(bit) for bit in port.get("bits", []))
             direction = port.get("direction", "inout")
             width = len(bits)
             suffix = f" [{width-1}:0]" if width > 1 else ""
-            node_id = "port_" + re.sub(r"[^A-Za-z0-9_]", "_", port_name)
-            lines.append(f'  {node_id} [label=<<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="7" COLOR="#64748b"><TR><TD BGCOLOR="#e2e8f0"><B>{esc(port_name + suffix)}</B></TD></TR><TR><TD><FONT POINT-SIZE="9">{esc(direction)}</FONT></TD></TR></TABLE>>];')
-            port_bits[port_name] = (node_id, bits, direction)
+            node_id = ident("topport_" + port_name)
+            color = "#000000"
+            fill = "#ffffff"
+            label = (f'<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="6" COLOR="{color}">'
+                     f'<TR><TD BGCOLOR="{fill}"><B>{esc(port_name + suffix)}</B></TD></TR></TABLE>')
+            lines.append(f'  {node_id} [label=<{label}>];')
+            top_ports[port_name] = (node_id, bits, direction)
+            (input_nodes if direction == "input" else output_nodes).append(node_id)
 
-        # Each instantiated RTL module becomes one compact functional block.
+        # Module instances are proper rectangular blocks. Each port has its own
+        # Graphviz port anchor, so wires attach at the correct side of the block.
+        instance_ports = {}
         for instance_name, cell in instances.items():
-            cell_type = cell.get("type", "module")
-            port_rows = []
-            for port_name, bits in cell.get("connections", {}).items():
+            node_id = ident(instance_name)
+            directions = cell.get("port_directions", {})
+            connections = cell.get("connections", {})
+            in_rows, out_rows = [], []
+            for port_name in sorted(connections):
+                direction = directions.get(port_name, "inout")
+                bits = connections[port_name]
                 width = len(bits)
                 suffix = f" [{width-1}:0]" if width > 1 else ""
-                direction = cell.get("port_directions", {}).get(port_name, "")
-                port_rows.append((port_name, suffix, direction))
-            rows = "".join(
-                f'<TR><TD ALIGN="LEFT"><FONT COLOR="{("#2563eb" if direction == "input" else "#059669" if direction == "output" else "#64748b")}">{esc(direction[:1].upper())}</FONT> {esc(name + suffix)}</TD></TR>'
-                for name, suffix, direction in port_rows
+                anchor = port_ident(port_name)
+                color = "#000000"
+                row = (f'<TR><TD PORT="{anchor}" ALIGN="LEFT">'
+                       f'<FONT COLOR="{color}">{"▶" if direction == "input" else "◀" if direction == "output" else "◆"}</FONT> '
+                       f'{esc(port_name + suffix)}</TD></TR>')
+                (in_rows if direction == "input" else out_rows).append(row)
+                instance_ports[(instance_name, port_name)] = (node_id, anchor, direction)
+            port_table = (
+                '<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="5" CELLSPACING="0" COLOR="#000000">'
+                f'<TR><TD COLSPAN="1" BGCOLOR="#ffffff"><B>{esc(instance_name)}</B><BR/>'
+                f'<FONT POINT-SIZE="9">{esc(cell.get("type", "module"))}</FONT></TD></TR>'
+                + "".join(in_rows + out_rows) + '</TABLE>'
             )
-            node_id = "inst_" + re.sub(r"[^A-Za-z0-9_]", "_", instance_name)
-            lines.append(f'  {node_id} [label=<<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="5" COLOR="#475569"><TR><TD BGCOLOR="#dbeafe"><B>{esc(instance_name)}</B><BR/><FONT POINT-SIZE="9">{esc(cell_type)}</FONT></TD></TR>{rows}</TABLE>>];')
+            lines.append(f'  {node_id} [label=<{port_table}>];')
 
-        # Collapse top-level primitive logic into one explicit block. This keeps
-        # the module-level overview readable without pretending those cells vanish.
+        # The JSON may contain top-level RTL primitives alongside module instances.
+        # Keep them visible as a clearly identified logic region rather than
+        # inventing internal functional blocks that are not present in the JSON.
+        logic_node = None
         if primitive_cells:
-            lines.append(f'  top_logic [label=<<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="8" COLOR="#a16207"><TR><TD BGCOLOR="#fef3c7"><B>Top-level logic</B></TD></TR><TR><TD><FONT POINT-SIZE="9">{len(primitive_cells)} RTL cells</FONT></TD></TR></TABLE>>];')
+            logic_node = "top_level_logic"
+            logic_table = (
+                '<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="8" COLOR="#000000">'
+                '<TR><TD BGCOLOR="#ffffff"><B>Top-level RTL logic</B></TD></TR>'
+                f'<TR><TD><FONT POINT-SIZE="9">{len(primitive_cells)} primitive cells</FONT></TD></TR>'
+                '</TABLE>'
+            )
+            lines.append(f'  {logic_node} [label=<{logic_table}>];')
 
-        # Build bit-level drivers/sinks, then combine wires between the same
-        # pair of blocks into labelled buses instead of drawing every bit.
-        drivers = {}
-        sinks = {}
-        for port_name, (node_id, bits, direction) in port_bits.items():
+        # Resolve bit drivers and sinks to actual module ports.
+        drivers, sinks = {}, {}
+        for port_name, (node_id, bits, direction) in top_ports.items():
             target = drivers if direction == "input" else sinks if direction == "output" else None
             if target is not None:
                 for bit in bits:
-                    target.setdefault(bit, []).append((node_id, port_name))
+                    target.setdefault(bit, []).append((node_id, None, port_name))
         for instance_name, cell in instances.items():
-            node_id = "inst_" + re.sub(r"[^A-Za-z0-9_]", "_", instance_name)
             for port_name, bits in cell.get("connections", {}).items():
-                direction = cell.get("port_directions", {}).get(port_name)
+                node_id, anchor, direction = instance_ports[(instance_name, port_name)]
                 target = sinks if direction == "input" else drivers if direction == "output" else None
                 if target is not None:
                     for bit in bits:
-                        target.setdefault(str(bit), []).append((node_id, port_name))
-        if primitive_cells:
+                        target.setdefault(str(bit), []).append((node_id, anchor, port_name))
+
+        # Aggregate primitive logic connections at the boundary of the logic block.
+        # It is deliberately shown as one region; the gate-level button expands cells.
+        if logic_node:
             for _, cell in primitive_cells:
                 for port_name, bits in cell.get("connections", {}).items():
                     direction = cell.get("port_directions", {}).get(port_name)
                     target = sinks if direction == "input" else drivers if direction == "output" else None
                     if target is not None:
                         for bit in bits:
-                            target.setdefault(str(bit), []).append(("top_logic", port_name))
+                            target.setdefault(str(bit), []).append((logic_node, None, port_name))
 
-        bit_labels = {}
-        # Prefer meaningful RTL identifiers; Yosys also exports internal names
-        # containing source paths and generated $-prefixed temporary nets.
+        bit_names = {}
         for net_name, net in module.get("netnames", {}).items():
             if net_name.startswith("$"):
                 continue
             for bit in net.get("bits", []):
-                bit_labels.setdefault(str(bit), net_name)
-        grouped_edges = {}
-        for bit, source_list in drivers.items():
-            for source_node, _ in source_list:
-                for sink_node, _ in sinks.get(bit, []):
-                    if source_node == sink_node:
-                        continue
-                    key = (source_node, sink_node)
-                    label = bit_labels.get(bit)
-                    if label:
-                        grouped_edges.setdefault(key, set()).add(label)
-                    else:
-                        grouped_edges.setdefault(key, set())
-        for (source_node, sink_node), labels in grouped_edges.items():
-            label_text = ", ".join(sorted(labels))
-            if len(label_text) > 100:
-                label_text = f"{len(labels)} connected nets"
-            attrs = f', label="{esc(label_text)}"' if label_text else ""
-            lines.append(f'  {source_node} -> {sink_node} [minlen=1{attrs}];')
+                bit_names.setdefault(str(bit), net_name)
 
+        grouped = {}
+        for bit, source_list in drivers.items():
+            for src_node, src_port, src_name in source_list:
+                for dst_node, dst_port, dst_name in sinks.get(bit, []):
+                    if src_node == dst_node:
+                        continue
+                    key = (src_node, src_port, dst_node, dst_port)
+                    grouped.setdefault(key, set())
+                    label = bit_names.get(bit)
+                    if label:
+                        grouped[key].add(label)
+
+        # Fan-out nets (especially clocks and reset) share one junction rather
+        # than drawing several independent long wires from the same input pin.
+        by_source = {}
+        for (src_node, src_port, dst_node, dst_port), names in grouped.items():
+            by_source.setdefault((src_node, src_port), []).append((dst_node, dst_port, names))
+
+        for source_index, ((src_node, src_port), destinations) in enumerate(by_source.items()):
+            source = f'{src_node}:{src_port}:e' if src_port else src_node
+            source_names = set()
+            for _, _, names in destinations:
+                source_names.update(names)
+            color = signal_color(" ".join(source_names)) if source_names else "#000000"
+            fanout = len(destinations) > 1 and src_node.startswith("n_topport_")
+            if fanout:
+                junction = f"fanout_{source_index}"
+                lines.append(f'  {junction} [shape=point, width=0.07, height=0.07, label="", color="{color}", fillcolor="{color}", style=filled];')
+                lines.append(f'  {source} -> {junction} [color="{color}", penwidth=1.45, arrowhead=none];')
+                source = junction
+            for dst_node, dst_port, names in destinations:
+                clean_names = sorted(names)
+                label = ", ".join(clean_names[:2])
+                if len(clean_names) > 2:
+                    label += f" +{len(clean_names)-2} nets"
+                dst = f'{dst_node}:{dst_port}:w' if dst_port else dst_node
+                attrs = [f'color="{color}"', f'fontcolor="{color}"']
+                if label and (not fanout or dst_node == destinations[0][0]):
+                    attrs.append(f'xlabel="{esc(label)}"')
+                lines.append(f'  {source} -> {dst} [{", ".join(attrs)}];')
+
+        # Guide the layout into a conventional left-to-right datapath instead
+        # of letting Graphviz place blocks solely by whichever net has most edges.
+        # These ranks describe the actual top-level module instances in this RTL.
+        stage_one = [ident(name) for name in ("u_lfsr", "u_chaos", "top_level_logic")
+                     if name in instances or name == "top_level_logic" and logic_node]
+        stage_two = [ident("u_alu")] if "u_alu" in instances else []
+        stage_three = [ident("u_pwm")] if "u_pwm" in instances else []
+        for stage in (stage_one, stage_two, stage_three):
+            if len(stage) > 1:
+                lines.append('  { rank=same; ' + "; ".join(stage) + '; }')
+        # Invisible ordering constraints establish the intended signal-flow direction.
+        if stage_one and stage_two:
+            for source in stage_one:
+                lines.append(f'  {source} -> {stage_two[0]} [style=invis, weight=8];')
+        if stage_two and stage_three:
+            lines.append(f'  {stage_two[0]} -> {stage_three[0]} [style=invis, weight=8];')
         lines.append("}")
         return "\n".join(lines)
 
@@ -1081,4 +1157,3 @@ class eda(tk.Tk):
 if __name__ == "__main__":
     app = eda()
     app.mainloop()
-
