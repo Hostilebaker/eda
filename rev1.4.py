@@ -706,10 +706,20 @@ class eda(tk.Tk):
 
             environment_bat = suite_root / "environment.bat"
             if os.name == "nt" and environment_bat.is_file():
-                # OSS CAD Suite sets DLL and runtime variables in this batch file.
-                command = f'call "{environment_bat}" && "{yosys_exe}" -s "{script_path}"'
+                # Run the suite environment setup and Yosys from a generated
+                # .cmd wrapper. This avoids cmd.exe /s /c quote parsing issues
+                # when the EDA installation path contains spaces.
+                launcher_path = output_dir / "run_yosys.cmd"
+                launcher_path.write_text(
+                    "@echo off\\r\\n"
+                    f'call "{environment_bat}"\\r\\n'
+                    "if errorlevel 1 exit /b %errorlevel%\\r\\n"
+                    f'"{yosys_exe}" -s "{script_path}"\\r\\n'
+                    "exit /b %errorlevel%\\r\\n",
+                    encoding="utf-8"
+                )
                 result = subprocess.run(
-                    ["cmd.exe", "/d", "/s", "/c", command],
+                    ["cmd.exe", "/d", "/c", str(launcher_path)],
                     cwd=self.project_dir, env=env,
                     capture_output=True, text=True
                 )
@@ -759,3 +769,4 @@ class eda(tk.Tk):
 if __name__ == "__main__":
     app = eda()
     app.mainloop()
+
