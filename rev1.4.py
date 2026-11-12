@@ -697,7 +697,9 @@ class eda(tk.Tk):
             f'synth -top {top}\n'
             'stat\n'
             f'write_verilog -noattr "{yosys_path(netlist_path)}"\n'
-            f'show -format dot -prefix "{yosys_path(dot_path.with_suffix(""))}" {top}\n'
+            # Use a relative prefix: Yosys show -prefix can retain quotes
+            # from an absolute Windows path and then fail to create the DOT file.
+            f'show -format dot -prefix schematic {top}\\n'
         )
         try:
             script_path.write_text(yosys_script, encoding="utf-8")
@@ -720,14 +722,14 @@ class eda(tk.Tk):
                 )
                 result = subprocess.run(
                     ["cmd.exe", "/d", "/c", str(launcher_path)],
-                    cwd=self.project_dir, env=env,
+                    cwd=schematic_dir, env=env,
                     capture_output=True, text=True
                 )
             else:
                 # Non-Windows fallback, or a suite installation without environment.bat.
                 result = subprocess.run(
                     [str(yosys_exe), "-s", str(script_path)],
-                    cwd=self.project_dir, env=env,
+                    cwd=schematic_dir, env=env,
                     capture_output=True, text=True
                 )
             self.processoutput(result)
