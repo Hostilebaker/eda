@@ -777,7 +777,179 @@ class eda(tk.Tk):
             return None
 
     def generate_rtl_schematic(self):
-        self.generate_json_schematic("rtl")
+        self.generate_hierarchical_rtl_schematic()
+
+    def build_hierarchical_rtl_dot(self, json_path, top):
+        """Build a readable module-level overview directly from Yosys RTL JSON."""
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        modules = data.get("modules", {})
+        if top not in modules:
+            raise ValueError(f"Top module '{top}' is not present in rtl.json.")
+        module = modules[top]
+        module_names = set(modules)
+        cells = module.get("cells", {})
+        instances = {}
+        primitive_cells = []
+        for cell_name, cell in cells.items():
+            cell_type = cell.get("type", "")
+            if cell_type in module_names:
+                instances[cell_name] = cell
+            else:
+                primitive_cells.append((cell_name, cell))
+
+        def esc(value):
+            return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+        lines = [
+            'digraph RTL {',
+            '  graph [rankdir=LR, bgcolor="white", pad="0.35", nodesep="0.55", ranksep="1.0", splines=polyline, overlap=false, fontname="Arial", label="' + esc(top) + '", labelloc=t, fontsize=20];',
+            '  node [shape=plain, fontname="Arial"];',
+            '  edge [fontname="Arial", fontsize=9, color="#555555", arrowsize=0.7];'
+        ]
+
+        # External interface nodes.
+        port_bits = {}
+        for port_name, port in module.get("ports", {}).items():
+            bits = tuple(str(bit) for bit in port.get("bits", []))
+            direction = port.get("direction", "inout")
+            width = len(bits)
+            suffix = f" [{width-1}:0]" if width > 1 else ""
+            node_id = "port_" + re.sub(r"[^A-Za-z0-9_]", "_", port_name)
+            lines.append(f'  {node_id} [label=<<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="7" COLOR="#64748b"><TR><TD BGCOLOR="#e2e8f0"><B>{esc(port_name + suffix)}</B></TD></TR><TR><TD><FONT POINT-SIZE="9">{esc(direction)}</FONT></TD></TR></TABLE>>];')
+            port_bits[port_name] = (node_id, bits, direction)
+
+        # Each instantiated RTL module becomes one compact functional block.
+        for instance_name, cell in instances.items():
+            cell_type = cell.get("type", "module")
+            port_rows = []
+            for port_name, bits in cell.get("connections", {}).items():
+                width = len(bits)
+                suffix = f" [{width-1}:0]" if width > 1 else ""
+                direction = cell.get("port_directions", {}).get(port_name, "")
+                port_rows.append((port_name, suffix, direction))
+            rows = "".join(
+                f'<TR><TD ALIGN="LEFT"><FONT COLOR="{("#2563eb" if direction == "input" else "#059669" if direction == "output" else "#64748b")}">{esc(direction[:1].upper())}</FONT> {esc(name + suffix)}</TD></TR>'
+                for name, suffix, direction in port_rows
+            )
+            node_id = "inst_" + re.sub(r"[^A-Za-z0-9_]", "_", instance_name)
+            lines.append(f'  {node_id} [label=<<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="5" COLOR="#475569"><TR><TD BGCOLOR="#dbeafe"><B>{esc(instance_name)}</B><BR/><FONT POINT-SIZE="9">{esc(cell_type)}</FONT></TD></TR>{rows}</TABLE>>];')
+
+        # Collapse top-level primitive logic into one explicit block. This keeps
+        # the module-level overview readable without pretending those cells vanish.
+        if primitive_cells:
+            lines.append(f'  top_logic [label=<<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="8" COLOR="#a16207"><TR><TD BGCOLOR="#fef3c7"><B>Top-level logic</B></TD></TR><TR><TD><FONT POINT-SIZE="9">{len(primitive_cells)} RTL cells</FONT></TD></TR></TABLE>>];')
+
+        # Build bit-level drivers/sinks, then combine wires between the same
+        # pair of blocks into labelled buses instead of drawing every bit.
+        drivers = {}
+        sinks = {}
+        for port_name, (node_id, bits, direction) in port_bits.items():
+            target = drivers if direction == "input" else sinks if direction == "output" else None
+            if target is not None:
+                for bit in bits:
+                    target.setdefault(bit, []).append((node_id, port_name))
+        for instance_name, cell in instances.items():
+            node_id = "inst_" + re.sub(r"[^A-Za-z0-9_]", "_", instance_name)
+            for port_name, bits in cell.get("connections", {}).items():
+                direction = cell.get("port_directions", {}).get(port_name)
+                target = sinks if direction == "input" else drivers if direction == "output" else None
+                if target is not None:
+                    for bit in bits:
+                        target.setdefault(str(bit), []).append((node_id, port_name))
+        if primitive_cells:
+            for _, cell in primitive_cells:
+                for port_name, bits in cell.get("connections", {}).items():
+                    direction = cell.get("port_directions", {}).get(port_name)
+                    target = sinks if direction == "input" else drivers if direction == "output" else None
+                    if target is not None:
+                        for bit in bits:
+                            target.setdefault(str(bit), []).append(("top_logic", port_name))
+
+        bit_labels = {}
+        # Prefer meaningful RTL identifiers; Yosys also exports internal names
+        # containing source paths and generated $-prefixed temporary nets.
+        for net_name, net in module.get("netnames", {}).items():
+            if net_name.startswith("$"):
+                continue
+            for bit in net.get("bits", []):
+                bit_labels.setdefault(str(bit), net_name)
+        grouped_edges = {}
+        for bit, source_list in drivers.items():
+            for source_node, _ in source_list:
+                for sink_node, _ in sinks.get(bit, []):
+                    if source_node == sink_node:
+                        continue
+                    key = (source_node, sink_node)
+                    label = bit_labels.get(bit)
+                    if label:
+                        grouped_edges.setdefault(key, set()).add(label)
+                    else:
+                        grouped_edges.setdefault(key, set())
+        for (source_node, sink_node), labels in grouped_edges.items():
+            label_text = ", ".join(sorted(labels))
+            if len(label_text) > 100:
+                label_text = f"{len(labels)} connected nets"
+            attrs = f', label="{esc(label_text)}"' if label_text else ""
+            lines.append(f'  {source_node} -> {sink_node} [minlen=1{attrs}];')
+
+        lines.append("}")
+        return "\n".join(lines)
+
+    def generate_hierarchical_rtl_schematic(self):
+        """Render the RTL hierarchy as module blocks, not a flattened cell tangle."""
+        if self.project_dir is None:
+            messagebox.showwarning("no project", "Create or open an EDA2 project first.")
+            return
+        if self.yosys_running:
+            messagebox.showinfo("EDA tool running", "A Yosys/Graphviz operation is already running. Please wait for it to finish.")
+            return
+        json_path = self.project_dir / "synthesis" / "rtl.json"
+        if not json_path.is_file():
+            messagebox.showerror("RTL JSON not found", f"Could not find {json_path}. Run synthesis first.")
+            return
+        top = self.find_json_top_module(json_path)
+        top_file = self.project_dir / "synthesis" / "top_module.txt"
+        if top_file.is_file():
+            try:
+                saved_top = top_file.read_text(encoding="utf-8").strip()
+                if saved_top:
+                    top = saved_top
+            except OSError:
+                pass
+        if not top:
+            messagebox.showerror("Top module not identified", "EDA2 could not identify a unique top module in rtl.json.")
+            return
+        env, tool_dirs, suite_root = self.tool_environment()
+        graphviz_exe = self.find_icarus_executable("dot", tool_dirs)
+        if graphviz_exe is None:
+            messagebox.showerror("Graphviz not found", "Could not find dot.exe under EDA/dependencies.")
+            return
+        schematic_dir = self.project_dir / "schematic"
+        schematic_dir.mkdir(parents=True, exist_ok=True)
+        dot_path = schematic_dir / "rtl_schematic.dot"
+        svg_path = schematic_dir / "rtl_schematic.svg"
+        try:
+            dot_path.write_text(self.build_hierarchical_rtl_dot(json_path, top), encoding="utf-8")
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            messagebox.showerror("RTL schematic error", f"Could not build the hierarchical RTL diagram: {exc}")
+            return
+        self.yosys_running = True
+        self.consoleprint(f"Generating hierarchical RTL schematic from {json_path.name}...\n")
+        self.consoleprint(f"Top module: {top}\n")
+
+        def worker():
+            try:
+                result = subprocess.run([graphviz_exe, "-Tsvg", str(dot_path), "-o", str(svg_path)], cwd=schematic_dir, env=env, capture_output=True, text=True)
+                self.yosys_queue.put(("graphviz", result.stdout, result.stderr, result.returncode))
+                if result.returncode != 0 or not svg_path.is_file() or svg_path.stat().st_size == 0:
+                    self.yosys_queue.put(("done", False, "Graphviz failed to create the hierarchical RTL schematic."))
+                else:
+                    self.yosys_queue.put(("done", True, "Hierarchical RTL schematic created: schematic/rtl_schematic.svg"))
+            except Exception as exc:
+                self.yosys_queue.put(("done", False, f"RTL schematic generation error: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self.poll_yosys_queue)
 
     def generate_gate_level_schematic(self):
         self.generate_json_schematic("gate")
@@ -909,3 +1081,4 @@ class eda(tk.Tk):
 if __name__ == "__main__":
     app = eda()
     app.mainloop()
+
