@@ -20,7 +20,7 @@
 #    me to save the file itself
 # -> rev 1.3 added the feature to open the latest waveform directly when i click gtk wave, and also lets me select another
 #    .vcd waveform file if the generated waveform is not the one i want to see, also added a check for the presence of gtkwave in the system path
-import json, os, re, shutil, subprocess, tempfile, tkinter as tk, zipfile
+import json, os, re, shutil, subprocess, tempfile, tkinter as tk, zipfile, threading, queue
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 title = "integrated asic platform rev1.4 (12/11/2026)"
@@ -51,6 +51,8 @@ class eda(tk.Tk):
         # Tool locations are resolved from the EDA2 dependencies folder or the
         # user's existing Desktop installation. No shell command is built from paths.
         self.oss_cad_suite = None
+        self.yosys_running = False
+        self.yosys_queue = queue.Queue()
         self.projectpage()
     def default_waveform_path(self):
         # Waveforms always belong to the active project's simulation directory.
@@ -579,6 +581,10 @@ class eda(tk.Tk):
         if self.project_dir is None:
             messagebox.showwarning("no project", "Create or open an EDA2 project first.")
             return
+        if self.yosys_running:
+            messagebox.showinfo("synthesis running", "Yosys/Graphviz is already running for this project.")
+            return
+
         vcode = self.verilog_editor.get("1.0", "end-1c").strip()
         if not vcode:
             messagebox.showwarning("no Verilog RTL", "Enter your design RTL before running Yosys.")
@@ -593,9 +599,7 @@ class eda(tk.Tk):
             if len(tops) > 1
             else f"Detected top module: {default_top}\nEnter a different name to override, or leave unchanged:"
         )
-        top = simpledialog.askstring(
-            "Top module", prompt, initialvalue=default_top, parent=self
-        )
+        top = simpledialog.askstring("Top module", prompt, initialvalue=default_top, parent=self)
         if top is None:
             self.consoleprint("Yosys synthesis cancelled.\n")
             return
@@ -603,18 +607,14 @@ class eda(tk.Tk):
         if not re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", top):
             messagebox.showerror("invalid top module", "Enter a valid Verilog module identifier.")
             return
-        if not re.search(
-            r"\bmodule\s+(?:automatic\s+|static\s+)?" + re.escape(top) + r"\b",
-            vcode
-        ):
+        if not re.search(r"\bmodule\s+(?:automatic\s+|static\s+)?" + re.escape(top) + r"\b", vcode):
             messagebox.showerror("module not found", f'The RTL does not declare a module named "{top}".')
             return
 
         env, tool_dirs, suite_root = self.tool_environment()
         if suite_root is None:
             selected = filedialog.askopenfilename(
-                title="Locate yosys.exe",
-                initialdir=str(self.dependencies_dir),
+                title="Locate yosys.exe", initialdir=str(self.dependencies_dir),
                 filetypes=[("Yosys executable", "yosys.exe"), ("Executable files", "*.exe"), ("All files", "*.*")]
             )
             if not selected:
@@ -628,7 +628,6 @@ class eda(tk.Tk):
             env["PATH"] = os.pathsep.join(tool_dirs + [env.get("PATH", "")])
         else:
             yosys_exe = suite_root / "bin" / "yosys.exe"
-
         if not yosys_exe.is_file():
             messagebox.showerror("Yosys executable not found", f"Could not find yosys.exe at {yosys_exe}")
             return
@@ -636,8 +635,7 @@ class eda(tk.Tk):
         dot_exe = self.find_graphviz_executable()
         if dot_exe is None:
             selected = filedialog.askopenfilename(
-                title="Locate Graphviz dot.exe",
-                initialdir=str(self.dependencies_dir),
+                title="Locate Graphviz dot.exe", initialdir=str(self.dependencies_dir),
                 filetypes=[("Graphviz dot executable", "dot.exe"), ("Executable files", "*.exe"), ("All files", "*.*")]
             )
             if not selected:
@@ -649,19 +647,17 @@ class eda(tk.Tk):
                 return
 
         self.sync_editors_to_project()
-        source_path = self.project_dir / "verilog" / "design.v"
-        output_dir = self.project_dir / "synthesis"
-        schematic_dir = self.project_dir / "schematic"
+        project_dir = self.project_dir
+        source_path = project_dir / "verilog" / "design.v"
+        output_dir = project_dir / "synthesis"
+        schematic_dir = project_dir / "schematic"
         output_dir.mkdir(parents=True, exist_ok=True)
         schematic_dir.mkdir(parents=True, exist_ok=True)
-
         netlist_path = output_dir / "synthesized.v"
         script_path = output_dir / "run_synthesis.ys"
         dot_path = schematic_dir / "schematic.dot"
         svg_path = schematic_dir / "schematic.svg"
 
-        # Yosys accepts forward-slash paths on Windows. Keep the generated
-        # script in the project so the exact synthesis flow can be inspected.
         def yosys_path(path):
             return path.resolve().as_posix().replace('"', '\\"')
 
@@ -671,73 +667,102 @@ class eda(tk.Tk):
             f'synth -top {top}\n'
             'stat\n'
             f'write_verilog -noattr "{yosys_path(netlist_path)}"\n'
-            # Use a relative prefix: Yosys show -prefix can retain quotes
-            # from an absolute Windows path and then fail to create the DOT file.
             f'show -format dot -prefix schematic {top}\n'
         )
         try:
             script_path.write_text(yosys_script, encoding="utf-8")
-            self.consoleprint(f"Starting generic Yosys synthesis for top module: {top}\n")
-            self.consoleprint(f"Yosys script: {script_path}\n")
-
+            launcher_path = output_dir / "run_yosys.cmd"
             environment_bat = suite_root / "environment.bat"
             if os.name == "nt" and environment_bat.is_file():
-                # Run the suite environment setup and Yosys from a generated
-                # .cmd wrapper. This avoids cmd.exe /s /c quote parsing issues
-                # when the EDA installation path contains spaces.
-                launcher_path = output_dir / "run_yosys.cmd"
                 launcher_path.write_text(
                     "@echo off\r\n"
                     f'call "{environment_bat}"\r\n'
                     "if errorlevel 1 exit /b %errorlevel%\r\n"
-                    # environment.bat may change the current directory while
-                    # initializing OSS CAD Suite. Restore the project schematic
-                    # directory before Yosys writes its relative DOT filename.
                     f'cd /d "{schematic_dir}"\r\n'
                     "if errorlevel 1 exit /b %errorlevel%\r\n"
                     f'"{yosys_exe}" -s "{script_path}"\r\n'
                     "exit /b %errorlevel%\r\n",
                     encoding="utf-8"
                 )
-                result = subprocess.run(
-                    ["cmd.exe", "/d", "/c", str(launcher_path)],
-                    cwd=schematic_dir, env=env,
-                    capture_output=True, text=True
-                )
+                yosys_command = ["cmd.exe", "/d", "/c", str(launcher_path)]
             else:
-                # Non-Windows fallback, or a suite installation without environment.bat.
-                result = subprocess.run(
-                    [str(yosys_exe), "-s", str(script_path)],
-                    cwd=schematic_dir, env=env,
-                    capture_output=True, text=True
-                )
-            self.processoutput(result)
-            if result.returncode != 0:
-                self.consoleprint(f"Yosys synthesis failed (exit code {result.returncode}).\n")
-                return
-            if not netlist_path.is_file():
-                self.consoleprint("Yosys exited successfully but did not create synthesized.v.\n")
-                return
-            if not dot_path.is_file():
-                self.consoleprint("Yosys created the netlist but did not create schematic.dot.\n")
-                return
+                yosys_command = [str(yosys_exe), "-s", str(script_path)]
 
-            self.consoleprint("Yosys synthesis successful. Netlist saved: synthesis/synthesized.v\n")
-            self.consoleprint("Schematic DOT saved: schematic/schematic.dot\n")
-            dot_result = subprocess.run(
-                [str(dot_exe), "-Tsvg", str(dot_path), "-o", str(svg_path)],
-                cwd=schematic_dir, env=env,
-                capture_output=True, text=True
-            )
-            self.processoutput(dot_result)
-            if dot_result.returncode != 0 or not svg_path.is_file():
-                self.consoleprint(f"Graphviz conversion failed (exit code {dot_result.returncode}).\n")
-                return
+            self.yosys_running = True
+            self.consoleprint(f"Starting Yosys in background for top module: {top}\n")
+            self.consoleprint("EDA2 remains usable while synthesis and Graphviz run.\n")
+            self.consoleprint(f"Yosys script: {script_path}\n")
 
-            self.consoleprint("Graphviz conversion successful. SVG saved: schematic/schematic.svg\n")
-            self.pack_project()
-        except OSError as e:
-            self.consoleprint(f"could not run Yosys/Graphviz: {e}\n")
+            def worker():
+                try:
+                    yosys_result = subprocess.run(
+                        yosys_command, cwd=schematic_dir, env=env,
+                        capture_output=True, text=True
+                    )
+                    self.yosys_queue.put(("yosys", yosys_result.stdout, yosys_result.stderr, yosys_result.returncode))
+                    if yosys_result.returncode != 0:
+                        self.yosys_queue.put(("done", False, f"Yosys exited with code {yosys_result.returncode}."))
+                        return
+                    if not netlist_path.is_file():
+                        self.yosys_queue.put(("done", False, "Yosys returned success but synthesized.v is missing."))
+                        return
+                    if not dot_path.is_file():
+                        self.yosys_queue.put(("done", False, "Yosys returned success but schematic.dot is missing."))
+                        return
+
+                    self.yosys_queue.put(("stage", "Graphviz is rendering schematic.svg..."))
+                    dot_result = subprocess.run(
+                        [str(dot_exe), "-Tsvg", str(dot_path), "-o", str(svg_path)],
+                        cwd=schematic_dir, env=env, capture_output=True, text=True
+                    )
+                    self.yosys_queue.put(("graphviz", dot_result.stdout, dot_result.stderr, dot_result.returncode))
+                    if dot_result.returncode != 0 or not svg_path.is_file():
+                        self.yosys_queue.put(("done", False, f"Graphviz failed (exit code {dot_result.returncode}); inspect its output above."))
+                        return
+                    self.yosys_queue.put(("done", True, "Synthesis, netlist export, DOT export and SVG rendering completed."))
+                except Exception as exc:
+                    self.yosys_queue.put(("done", False, f"Background synthesis error: {exc}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+            self.after(100, self.poll_yosys_queue)
+        except OSError as exc:
+            self.yosys_running = False
+            self.consoleprint(f"could not start Yosys/Graphviz: {exc}\n")
+
+    def poll_yosys_queue(self):
+        """Transfer background-process output to Tkinter on the GUI thread."""
+        try:
+            while True:
+                item = self.yosys_queue.get_nowait()
+                if item[0] in ("yosys", "graphviz"):
+                    stage, stdout, stderr, returncode = item
+                    if stdout:
+                        self.consoleprint(stdout)
+                    if stderr:
+                        self.consoleprint(stderr)
+                    if stage == "yosys" and returncode == 0:
+                        self.consoleprint("Yosys completed: synthesized.v and schematic.dot generated.\n")
+                    elif stage == "graphviz" and returncode == 0:
+                        self.consoleprint("Graphviz completed: schematic.svg generated.\n")
+                elif item[0] == "stage":
+                    self.consoleprint(item[1] + "\n")
+                elif item[0] == "done":
+                    success, detail = item[1], item[2]
+                    self.yosys_running = False
+                    self.consoleprint(detail + "\n")
+                    if success:
+                        self.consoleprint("Outputs: synthesis/synthesized.v, schematic/schematic.dot, schematic/schematic.svg\n")
+                        try:
+                            self.pack_project()
+                        except OSError as exc:
+                            self.consoleprint(f"Could not save project metadata: {exc}\n")
+                    else:
+                        self.consoleprint("Synthesis workflow failed; see the stage-specific output above.\n")
+                    return
+        except queue.Empty:
+            pass
+        if self.yosys_running:
+            self.after(100, self.poll_yosys_queue)
 
     def confirm_verilog(self): pass
     def confirm_floorplan(self): pass
