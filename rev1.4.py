@@ -2,7 +2,7 @@
 #
 # kushagra srivastava (hostilebaker on github)
 #
-# integrated vlsi platform rev 1.4 (27/10/2026) (start date:-17/06/2026)
+# integrated vlsi platform rev 1.3 (27/10/2026) (start date:-17/06/2026)
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose is hereby granted, provided that the above
@@ -35,14 +35,15 @@ class eda(tk.Tk):
         self.geometry("1100x720")
         self.minsize(850, 560)
         self.PP = self.verilog_editor = self.testbench_editor = self.OC = None
-        # EDA2's application root contains the shared dependencies and projects.
-        self.app_dir = Path(__file__).resolve().parent
+        # Keep the application, shared dependencies, and projects under one EDA folder.
+        script_dir = Path(__file__).resolve().parent
+        self.app_dir = script_dir if script_dir.name.lower() == "eda" else script_dir / "EDA"
+        self.app_dir.mkdir(parents=True, exist_ok=True)
         self.dependencies_dir = self.app_dir / "dependencies"
         self.projects_dir = self.app_dir / "projects"
         self.dependencies_dir.mkdir(parents=True, exist_ok=True)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir = None
-        self.project_tempdir = None
         self.waveform_path = None
         self.gtkwave_path = None
         self.protocol("WM_DELETE_WINDOW", self.close_app)
@@ -59,19 +60,20 @@ class eda(tk.Tk):
             "constraints", "sta", "floorplan", "placement", "routing",
             "layout", "logs"
         ):
-            folder_path = root / folder
-            folder_path.mkdir(parents=True, exist_ok=True)
-            (folder_path / ".keep").write_text("", encoding="utf-8")
-        (root / "verilog" / "design.v").write_text("", encoding="utf-8")
-        (root / "verilog" / "testbench.v").write_text("", encoding="utf-8")
-        metadata = {"format": "EDA2", "format_version": 2, "project_name": self.PP.stem if self.PP else "untitled"}
-        (root / "project.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    def start_project_workspace(self):
-        if self.project_tempdir is not None:
-            self.project_tempdir.cleanup()
-        self.project_tempdir = tempfile.TemporaryDirectory(prefix="eda2_project_")
-        self.project_dir = Path(self.project_tempdir.name)
+            (root / folder).mkdir(parents=True, exist_ok=True)
+        design_path = root / "verilog" / "design.v"
+        testbench_path = root / "verilog" / "testbench.v"
+        if not design_path.exists():
+            design_path.write_text("", encoding="utf-8")
+        if not testbench_path.exists():
+            testbench_path.write_text("", encoding="utf-8")
+
+    def start_project_workspace(self, project_dir):
+        # Projects are real folders; no temporary extraction or repacking is used.
+        self.project_dir = Path(project_dir).resolve()
+        self.project_dir.mkdir(parents=True, exist_ok=True)
         self.waveform_path = self.project_dir / "simulation" / "waveform.vcd"
+
     def sync_editors_to_project(self):
         if self.project_dir is None or self.verilog_editor is None or self.testbench_editor is None:
             return
@@ -79,35 +81,32 @@ class eda(tk.Tk):
         verilog_dir.mkdir(parents=True, exist_ok=True)
         (verilog_dir / "design.v").write_text(self.verilog_editor.get("1.0", "end-1c"), encoding="utf-8")
         (verilog_dir / "testbench.v").write_text(self.testbench_editor.get("1.0", "end-1c"), encoding="utf-8")
+
     def pack_project(self):
+        # Kept under its old method name so existing button/tool callbacks remain intact.
+        # The .eda2 file is a small JSON project descriptor, not an archive.
         if self.PP is None or self.project_dir is None:
             return False
         self.sync_editors_to_project()
-        metadata_path = self.project_dir / "project.json"
-        metadata = {"format": "EDA2", "format_version": 2, "project_name": self.PP.stem}
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        metadata = {
+            "format": "EDA2",
+            "format_version": 3,
+            "project_name": self.project_dir.name,
+            "project_directory": self.project_dir.name,
+            "entry_point": self.PP.name
+        }
         self.PP.parent.mkdir(parents=True, exist_ok=True)
-        temp_archive = self.PP.with_name(self.PP.name + ".tmp")
-        try:
-            with zipfile.ZipFile(temp_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for item in self.project_dir.rglob("*"):
-                    if item.is_file():
-                        archive.write(item, item.relative_to(self.project_dir).as_posix())
-            os.replace(temp_archive, self.PP)
-            return True
-        except OSError:
-            temp_archive.unlink(missing_ok=True)
-            raise
+        self.PP.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        return True
+
     def close_app(self):
         if self.PP is not None and self.project_dir is not None:
-            if messagebox.askyesno("save project", "Save all project files into the .eda2 archive before closing?"):
+            if messagebox.askyesno("save project", "Save the current Verilog files and project metadata before closing?"):
                 try:
                     self.pack_project()
                 except OSError as e:
                     messagebox.showerror("save failed", str(e))
                     return
-        if self.project_tempdir is not None:
-            self.project_tempdir.cleanup()
         self.destroy()
     def delete(self):
         for child in self.winfo_children():
@@ -129,16 +128,31 @@ class eda(tk.Tk):
         )
         if not filepath:
             return
-        self.PP = Path(filepath)
-        self.start_project_workspace()
+        requested_path = Path(filepath).resolve()
+        project_name = requested_path.stem
+        if not project_name or project_name in (".", ".."):
+            messagebox.showerror("invalid project name", "Enter a valid project name.")
+            return
+        project_dir = self.projects_dir / project_name
+        if project_dir.exists() and any(project_dir.iterdir()):
+            messagebox.showerror(
+                "project already exists",
+                f'The project folder already exists:\n{project_dir}\n\nOpen that project instead of creating it again.'
+            )
+            return
+        self.project_dir = project_dir
+        self.PP = project_dir / f"{project_name}{filetype}"
+        self.start_project_workspace(project_dir)
         self.create_project_structure(self.project_dir)
         self.waveform_path = self.default_waveform_path()
         self.showeditor("", "")
         try:
             self.pack_project()
-            self.consoleprint(f"Created project archive: {self.PP}\n")
+            self.consoleprint(f"Created project folder: {self.project_dir}\n")
+            self.consoleprint(f"Project file: {self.PP}\n")
         except OSError as e:
             messagebox.showerror("project creation failed", str(e))
+
     def openexistingproject(self):
         filepath = filedialog.askopenfilename(
             title="open project", initialdir=str(self.projects_dir),
@@ -146,53 +160,67 @@ class eda(tk.Tk):
         )
         if not filepath:
             return
-        project_path = Path(filepath)
-        self.PP = project_path
-        self.start_project_workspace()
+        selected_path = Path(filepath).resolve()
         try:
-            if zipfile.is_zipfile(project_path):
-                with zipfile.ZipFile(project_path, "r") as archive:
+            if not selected_path.is_file() or selected_path.suffix.lower() != filetype:
+                raise ValueError("Select a valid .eda2 project file.")
+
+            # Legacy ZIP-based projects are imported into a same-named project folder.
+            if zipfile.is_zipfile(selected_path):
+                project_dir = self.projects_dir / selected_path.stem
+                project_dir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(selected_path, "r") as archive:
+                    root_resolved = project_dir.resolve()
                     for member in archive.infolist():
-                        target = (self.project_dir / member.filename).resolve()
-                        if self.project_dir.resolve() not in target.parents and target != self.project_dir.resolve():
+                        target = (project_dir / member.filename).resolve()
+                        if root_resolved not in target.parents and target != root_resolved:
                             raise ValueError("Project archive contains an unsafe file path.")
-                    archive.extractall(self.project_dir)
-                design_path = self.project_dir / "verilog" / "design.v"
-                testbench_path = self.project_dir / "verilog" / "testbench.v"
+                    archive.extractall(project_dir)
+                self.project_dir = project_dir
+                self.PP = project_dir / f"{project_dir.name}{filetype}"
+                self.start_project_workspace(project_dir)
+                self.create_project_structure(project_dir)
+                design_path = project_dir / "verilog" / "design.v"
+                testbench_path = project_dir / "verilog" / "testbench.v"
                 vcode = design_path.read_text(encoding="utf-8") if design_path.is_file() else ""
                 tbcode = testbench_path.read_text(encoding="utf-8") if testbench_path.is_file() else ""
+                self.pack_project()
             else:
-                # Import projects created by the older JSON-based EDA2 versions.
-                data = json.loads(project_path.read_text(encoding="utf-8"))
-                vcode, tbcode = data.get("verilog", ""), data.get("testbench", "")
-                self.create_project_structure(self.project_dir)
-                (self.project_dir / "verilog" / "design.v").write_text(vcode, encoding="utf-8")
-                (self.project_dir / "verilog" / "testbench.v").write_text(tbcode, encoding="utf-8")
+                project_dir = selected_path.parent
+                self.project_dir = project_dir
+                self.PP = selected_path
+                self.start_project_workspace(project_dir)
+                self.create_project_structure(project_dir)
+                try:
+                    data = json.loads(selected_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"The selected .eda2 file is not valid project metadata: {exc}") from exc
+                # Support older standalone JSON project files as well as the new project descriptor.
+                if "verilog" in data or "testbench" in data:
+                    (project_dir / "verilog" / "design.v").write_text(data.get("verilog", ""), encoding="utf-8")
+                    (project_dir / "verilog" / "testbench.v").write_text(data.get("testbench", ""), encoding="utf-8")
+                vcode = (project_dir / "verilog" / "design.v").read_text(encoding="utf-8")
+                tbcode = (project_dir / "verilog" / "testbench.v").read_text(encoding="utf-8")
+                self.pack_project()
         except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as e:
-            if self.project_tempdir is not None:
-                self.project_tempdir.cleanup()
-            self.project_tempdir = self.project_dir = None
+            self.project_dir = None
             self.PP = None
             messagebox.showerror("open failed", f"Could not open EDA2 project: {e}")
             return
         self.waveform_path = self.default_waveform_path()
         self.showeditor(vcode, tbcode)
-        self.consoleprint(f"Opened project archive: {filepath}\n")
+        self.consoleprint(f"Opened project folder: {self.project_dir}\n")
+        self.consoleprint(f"Project file: {self.PP}\n")
+
     def saveproject(self):
-        if self.PP is None:
-            filepath = filedialog.asksaveasfilename(
-                title="save EDA2 project", defaultextension=filetype,
-                initialdir=str(self.projects_dir), initialfile=f"new_project{filetype}",
-                filetypes=[("EDA2 project", f"*{filetype}")]
-            )
-            if not filepath:
-                return
-            self.PP = Path(filepath)
+        if self.PP is None or self.project_dir is None:
+            messagebox.showwarning("no project", "Create or open an EDA2 project first.")
+            return
         try:
             if self.pack_project():
-                self.consoleprint(f"Saved complete project archive: {self.PP}\n")
+                self.consoleprint(f"Saved project: {self.PP}\n")
         except OSError as e:
-            messagebox.showerror("save failed", f"Could not save project archive: {e}")
+            messagebox.showerror("save failed", f"Could not save project: {e}")
     def showeditor(self, vcode, tbcode):
         self.delete()
         toolbar = tk.Frame(self, padx=10, pady=8, bg="#f2f2f2")
@@ -467,7 +495,7 @@ class eda(tk.Tk):
             self.OC.insert("end", text)
             self.OC.see("end")
     def homeconfirm(self):
-        if not messagebox.askyesno("return home", "Return to start page? The current project will be saved into its .eda2 archive."):
+        if not messagebox.askyesno("return home", "Return to start page? The current project files and .eda2 descriptor will be saved."):
             return
         try:
             if self.PP is not None:
@@ -475,9 +503,7 @@ class eda(tk.Tk):
         except OSError as e:
             messagebox.showerror("save failed", str(e))
             return
-        if self.project_tempdir is not None:
-            self.project_tempdir.cleanup()
-        self.project_tempdir = self.project_dir = None
+        self.project_dir = None
         self.PP = None
         self.waveform_path = None
         self.projectpage()
