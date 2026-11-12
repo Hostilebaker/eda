@@ -20,9 +20,13 @@ The current version provides a python/Tkinter interface for writing verilog RTL 
 - Layout inspection using KLayout
 
 ## Requirements
-- Python 3
+- Python 
 - Icarus Verilog
 - GTKWave
+- Yosys
+- Graphviz
+- OpenROAD
+- OpenSTA
 
 Additional dependencies will be required as further design-flow stages are integrated.
 
