@@ -229,7 +229,16 @@ class eda(tk.Tk):
         toolbar = tk.Frame(self, padx=10, pady=8, bg="#f2f2f2")
         toolbar.pack(side="top", fill="x")
         tk.Label(toolbar, text=self.projectlabel(), bg="#f2f2f2", font=(arial, 11, "bold")).pack(side="left")
-        for text, command in [("verilog", self.confirm_verilog), ("synthesis", self.confirm_synthesis), ("floorplan", self.confirm_floorplan), ("yosys", self.confirm_yosys), ("STA", self.confirm_sta), ("klayout", self.confirm_klayout), ("GTKWave", self.open_waveform)]:
+        for text, command in [
+            ("verilog", self.confirm_verilog),
+            ("synthesis", self.confirm_synthesis),
+            ("RTL", self.generate_rtl_schematic),
+            ("gate level", self.generate_gate_level_schematic),
+            ("floorplan", self.confirm_floorplan),
+            ("STA", self.confirm_sta),
+            ("klayout", self.confirm_klayout),
+            ("GTKWave", self.open_waveform)
+        ]:
             tk.Button(toolbar, text=text, font=(arial, 9), command=command).pack(side="left", padx=(10, 0))
         for text, command in [("home", self.homeconfirm), ("save", self.saveproject), ("run", self.runproject)]:
             tk.Button(toolbar, text=text, font=(arial, 9), command=command).pack(side="right", padx=(6, 0))
@@ -629,6 +638,9 @@ class eda(tk.Tk):
         netlist_path = output_dir / "synthesized.v"
         script_path = output_dir / "run_synthesis.ys"
         json_path = output_dir / "synthesized.json"
+        rtl_json_path = output_dir / "rtl.json"
+        top_module_path = output_dir / "top_module.txt"
+        top_module_path.write_text(top, encoding="utf-8")
 
         def yosys_path(path):
             return path.resolve().as_posix().replace('"', '\\"')
@@ -636,6 +648,11 @@ class eda(tk.Tk):
         yosys_script = (
             f'read_verilog "{yosys_path(source_path)}"\n'
             f'hierarchy -check -top {top}\n'
+            # Preserve a pre-mapping RTL-oriented representation for the RTL viewer.
+            # This is intentionally exported before synth performs gate-level lowering.
+            'proc\n'
+            'opt\n'
+            f'write_json "{yosys_path(rtl_json_path)}"\n'
             f'synth -top {top}\n'
             'stat\n'
             f'write_verilog -noattr "{yosys_path(netlist_path)}"\n'
@@ -681,8 +698,11 @@ class eda(tk.Tk):
                     if not json_path.is_file():
                         self.yosys_queue.put(("done", False, "Yosys returned success but synthesized.json is missing."))
                         return
+                    if not rtl_json_path.is_file():
+                        self.yosys_queue.put(("done", False, "Yosys returned success but rtl.json is missing."))
+                        return
 
-                    self.yosys_queue.put(("done", True, "Synthesis completed. Verilog netlist and machine-readable JSON netlist generated; SVG rendering is disabled."))
+                    self.yosys_queue.put(("done", True, "Synthesis completed. RTL and gate-level JSON files are ready for schematic generation."))
                 except Exception as exc:
                     self.yosys_queue.put(("done", False, f"Background synthesis error: {exc}"))
 
@@ -712,7 +732,7 @@ class eda(tk.Tk):
                     self.yosys_running = False
                     self.consoleprint(detail + "\n")
                     if success:
-                        self.consoleprint("Outputs: synthesis/synthesized.v, synthesis/synthesized.json\n")
+                        self.consoleprint("Outputs: synthesis/rtl.json, synthesis/synthesized.v, synthesis/synthesized.json\n")
                         try:
                             self.pack_project()
                         except OSError as exc:
@@ -725,11 +745,164 @@ class eda(tk.Tk):
         if self.yosys_running:
             self.after(100, self.poll_yosys_queue)
 
+    def find_json_top_module(self, json_path):
+        """Find the top module from Yosys JSON metadata or module instantiations."""
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            modules = data.get("modules", {})
+            marked_tops = []
+            for name, module in modules.items():
+                top_value = module.get("attributes", {}).get("top")
+                if top_value not in (None, "0", "00000000000000000000000000000000", 0, False):
+                    marked_tops.append(name)
+            if len(marked_tops) == 1:
+                return marked_tops[0]
+
+            instantiated = set()
+            module_names = set(modules)
+            for module in modules.values():
+                for cell in module.get("cells", {}).values():
+                    cell_type = cell.get("type")
+                    if cell_type in module_names:
+                        instantiated.add(cell_type)
+            roots = [name for name in modules if name not in instantiated]
+            if len(roots) == 1:
+                return roots[0]
+            if len(marked_tops) > 1:
+                return marked_tops[0]
+            if len(roots) > 1:
+                return None
+            return next(iter(modules), None)
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+            return None
+
+    def generate_rtl_schematic(self):
+        self.generate_json_schematic("rtl")
+
+    def generate_gate_level_schematic(self):
+        self.generate_json_schematic("gate")
+
+    def generate_json_schematic(self, schematic_type):
+        """Render an existing Yosys JSON file through Yosys show and Graphviz."""
+        if self.project_dir is None:
+            messagebox.showwarning("no project", "Create or open an EDA2 project first.")
+            return
+        if self.yosys_running:
+            messagebox.showinfo("EDA tool running", "A Yosys operation is already running. Please wait for it to finish.")
+            return
+
+        output_dir = self.project_dir / "synthesis"
+        if schematic_type == "rtl":
+            json_path = output_dir / "rtl.json"
+            name = "rtl_schematic"
+            description = "RTL"
+        else:
+            json_path = output_dir / "synthesized.json"
+            name = "gate_level_schematic"
+            description = "gate-level"
+
+        if not json_path.is_file():
+            messagebox.showerror(
+                f"{description} JSON not found",
+                f"Could not find {json_path.name} in the project's synthesis folder. Run synthesis first."
+            )
+            return
+
+        top_module_path = output_dir / "top_module.txt"
+        top = None
+        if top_module_path.is_file():
+            try:
+                top = top_module_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                top = None
+        if not top:
+            top = self.find_json_top_module(json_path)
+        if not top:
+            messagebox.showerror(
+                "top module not identified",
+                f"EDA2 could not identify a unique top module in {json_path.name}."
+            )
+            return
+
+        env, tool_dirs, suite_root = self.tool_environment()
+        if suite_root is None:
+            messagebox.showerror("Yosys not found", "Could not find the OSS CAD Suite under EDA/dependencies.")
+            return
+        yosys_exe = suite_root / "bin" / "yosys.exe"
+        if not yosys_exe.is_file():
+            messagebox.showerror("Yosys not found", f"Could not find yosys.exe at {yosys_exe}")
+            return
+        graphviz_exe = self.find_icarus_executable("dot", tool_dirs)
+        if graphviz_exe is None:
+            messagebox.showerror("Graphviz not found", "Could not find dot.exe under EDA/dependencies.")
+            return
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        schematic_dir = self.project_dir / "schematic"
+        schematic_dir.mkdir(parents=True, exist_ok=True)
+        dot_path = schematic_dir / f"{name}.dot"
+        svg_path = schematic_dir / f"{name}.svg"
+        script_path = output_dir / f"{name}.ys"
+        json_yosys_path = json_path.resolve().as_posix().replace('"', '\\"')
+        script_path.write_text(
+            f'read_json "{json_yosys_path}"\n'
+            f'hierarchy -check -top {top}\n'
+            f'show -format dot -prefix {name} {top}\n',
+            encoding="utf-8"
+        )
+
+        launcher_path = output_dir / f"run_{name}.cmd"
+        environment_bat = suite_root / "environment.bat"
+        if os.name == "nt" and environment_bat.is_file():
+            launcher_path.write_text(
+                "@echo off\r\n"
+                f'call "{environment_bat}"\r\n'
+                "if errorlevel 1 exit /b %errorlevel%\r\n"
+                f'cd /d "{schematic_dir}"\r\n'
+                "if errorlevel 1 exit /b %errorlevel%\r\n"
+                f'"{yosys_exe}" -s "{script_path}"\r\n'
+                "exit /b %errorlevel%\r\n",
+                encoding="utf-8"
+            )
+            yosys_command = ["cmd.exe", "/d", "/c", str(launcher_path)]
+        else:
+            yosys_command = [str(yosys_exe), "-s", str(script_path)]
+
+        self.yosys_running = True
+        self.consoleprint(f"Generating {description} schematic from existing {json_path.name}...\n")
+        self.consoleprint(f"Top module: {top}\n")
+
+        def worker():
+            try:
+                yosys_result = subprocess.run(
+                    yosys_command, cwd=schematic_dir, env=env,
+                    capture_output=True, text=True
+                )
+                self.yosys_queue.put(("yosys", yosys_result.stdout, yosys_result.stderr, yosys_result.returncode))
+                if yosys_result.returncode != 0:
+                    self.yosys_queue.put(("done", False, f"Yosys failed while creating {description} DOT ({yosys_result.returncode})."))
+                    return
+                if not dot_path.is_file() or dot_path.stat().st_size == 0:
+                    self.yosys_queue.put(("done", False, f"Yosys did not create a valid {dot_path.name}."))
+                    return
+                graphviz_result = subprocess.run(
+                    [graphviz_exe, "-Tsvg", str(dot_path), "-o", str(svg_path)],
+                    cwd=schematic_dir, env=env, capture_output=True, text=True
+                )
+                self.yosys_queue.put(("graphviz", graphviz_result.stdout, graphviz_result.stderr, graphviz_result.returncode))
+                if graphviz_result.returncode != 0 or not svg_path.is_file() or svg_path.stat().st_size == 0:
+                    self.yosys_queue.put(("done", False, f"Graphviz failed to create {svg_path.name}."))
+                    return
+                self.yosys_queue.put(("done", True, f"{description} schematic created: schematic/{svg_path.name}"))
+            except Exception as exc:
+                self.yosys_queue.put(("done", False, f"{description} schematic generation error: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self.poll_yosys_queue)
+
     def confirm_verilog(self): pass
     def confirm_floorplan(self): pass
     def confirm_synthesis(self):
-        self.run_yosys()
-    def confirm_yosys(self):
         self.run_yosys()
     def confirm_sta(self): pass
     def confirm_klayout(self): pass
