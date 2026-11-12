@@ -258,65 +258,39 @@ class eda(tk.Tk):
     def projectlabel(self):
         return f"project- {self.PP.name}" if self.PP else "project- untitled"
     def find_oss_cad_suite(self):
-        """Find the OSS CAD Suite root without relying on the process PATH."""
-        app_dir = Path(__file__).resolve().parent
-        desktop = Path.home() / "Desktop"
-        search_roots = [
-            self.dependencies_dir / "yosys",
-            self.dependencies_dir,
-            app_dir / "yosys",
-            desktop / "eda2 dependencies" / "yosys",
-            desktop / "yosys",
-        ]
-        for root in search_roots:
-            if (root / "bin" / "yosys.exe").is_file():
-                return root
-            if root.is_dir():
-                for candidate in root.glob("oss-cad-suite*/oss-cad-suite"):
-                    if (candidate / "bin" / "yosys.exe").is_file():
-                        return candidate
-                # Also support a directly extracted suite folder.
-                for candidate in root.glob("oss-cad-suite*"):
-                    if (candidate / "bin" / "yosys.exe").is_file():
-                        return candidate
+        """Find the OSS CAD Suite only inside EDA2/dependencies."""
+        if not self.dependencies_dir.is_dir():
+            return None
+        for current_root, _, filenames in os.walk(self.dependencies_dir):
+            if "yosys.exe" in {name.casefold() for name in filenames}:
+                executable = Path(current_root) / "yosys.exe"
+                if executable.parent.name.casefold() == "bin":
+                    return executable.parent.parent
         return None
 
     def tool_environment(self):
-        """Return a child-process environment with EDA2's bundled tools on PATH."""
+        """Return a child-process environment using tools under EDA/dependencies."""
         env = os.environ.copy()
-        app_dir = Path(__file__).resolve().parent
-        desktop = Path.home() / "Desktop"
         tool_dirs = []
 
-        # Standalone Icarus installation used on this machine.
-        # The actual path is: Desktop\eda2dependencies\icarus\iverilog\bin
-        icarus_bases = (
-            self.dependencies_dir / "icarus",
-            self.dependencies_dir / "iverilog",
-            self.dependencies_dir / "icarus" / "iverilog",
-            app_dir / "icarus",
-            desktop / "eda2dependencies" / "icarus" / "iverilog",
-            desktop / "eda2 dependencies" / "icarus" / "iverilog",
-            desktop / "eda2 dependencies" / "icarus",
-        )
-        for base in icarus_bases:
-            for candidate in (base / "bin", base):
-                if candidate.is_dir():
-                    tool_dirs.append(candidate)
+        if self.dependencies_dir.is_dir():
+            for current_root, _, filenames in os.walk(self.dependencies_dir):
+                names = {name.casefold() for name in filenames}
+                if {"iverilog.exe", "vvp.exe"} & names or "dot.exe" in names:
+                    tool_dirs.append(current_root)
 
         suite = self.find_oss_cad_suite()
         if suite is not None:
             self.oss_cad_suite = suite
             for candidate in (suite / "bin", suite / "lib", suite / "mingw64" / "bin", suite):
                 if candidate.is_dir():
-                    tool_dirs.append(candidate)
+                    tool_dirs.append(str(candidate))
 
-        # Remove duplicates while preserving order. Windows PATH entries with
-        # spaces are valid as-is; quoting PATH entries would be incorrect.
+        # Remove duplicates while preserving order.
         unique_dirs = []
         seen = set()
         for directory in tool_dirs:
-            value = str(directory.resolve())
+            value = str(Path(directory).resolve())
             key = os.path.normcase(value)
             if key not in seen:
                 seen.add(key)
@@ -699,7 +673,7 @@ class eda(tk.Tk):
             f'write_verilog -noattr "{yosys_path(netlist_path)}"\n'
             # Use a relative prefix: Yosys show -prefix can retain quotes
             # from an absolute Windows path and then fail to create the DOT file.
-            f'show -format dot -prefix schematic {top}\\n'
+            f'show -format dot -prefix schematic {top}\n'
         )
         try:
             script_path.write_text(yosys_script, encoding="utf-8")
@@ -715,6 +689,11 @@ class eda(tk.Tk):
                 launcher_path.write_text(
                     "@echo off\r\n"
                     f'call "{environment_bat}"\r\n'
+                    "if errorlevel 1 exit /b %errorlevel%\r\n"
+                    # environment.bat may change the current directory while
+                    # initializing OSS CAD Suite. Restore the project schematic
+                    # directory before Yosys writes its relative DOT filename.
+                    f'cd /d "{schematic_dir}"\r\n'
                     "if errorlevel 1 exit /b %errorlevel%\r\n"
                     f'"{yosys_exe}" -s "{script_path}"\r\n'
                     "exit /b %errorlevel%\r\n",
