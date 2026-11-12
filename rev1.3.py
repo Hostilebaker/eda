@@ -20,10 +20,10 @@
 #    me to save the file itself
 # -> rev 1.3 added the feature to open the latest waveform directly when i click gtk wave, and also lets me select another
 #    .vcd waveform file if the generated waveform is not the one i want to see, also added a check for the presence of gtkwave in the system path
-import json, os, re, subprocess, tempfile, tkinter as tk
+import json, os, re, shutil, subprocess, tempfile, tkinter as tk, zipfile
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, simpledialog
-title = "integrated asic platform rev1.3 (2/11/2026)"
+from tkinter import filedialog, messagebox, simpledialog
+title = "integrated asic platform rev1.4 (12/11/2026)"
 filetype = ".eda2" # fix this in later revs, might get confused
 var1 = " "
 var2 = " "
@@ -34,16 +34,81 @@ class eda(tk.Tk):
         self.title(title)
         self.geometry("1100x720")
         self.minsize(850, 560)
-        self.PP   = self.verilog_editor = self.testbench_editor = self.OC = None
-        self.waveform_path = self.default_waveform_path()
+        self.PP = self.verilog_editor = self.testbench_editor = self.OC = None
+        # EDA2's application root contains the shared dependencies and projects.
+        self.app_dir = Path(__file__).resolve().parent
+        self.dependencies_dir = self.app_dir / "dependencies"
+        self.projects_dir = self.app_dir / "projects"
+        self.dependencies_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.project_dir = None
+        self.project_tempdir = None
+        self.waveform_path = None
         self.gtkwave_path = None
-        # OSS CAD Suite installation used by this setup; can be changed if moved.
-        self.yosys_start_bat = (Path.home() / "Desktop" / "yosys" /
-                                "oss-cad-suite-windows-x64-20261026" / "oss-cad-suite" / "start.bat")
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+        # Tool locations are resolved from the EDA2 dependencies folder or the
+        # user's existing Desktop installation. No shell command is built from paths.
+        self.oss_cad_suite = None
         self.projectpage()
     def default_waveform_path(self):
-        # Keep generated waveforms beside the EDA2 script unless a project is saved.
-        return Path(__file__).resolve().parent / "waveform.vcd"
+        # Waveforms always belong to the active project's simulation directory.
+        return self.project_dir / "simulation" / "waveform.vcd" if self.project_dir else None
+    def create_project_structure(self, root):
+        for folder in (
+            "verilog", "simulation", "synthesis/reports", "schematic",
+            "constraints", "sta", "floorplan", "placement", "routing",
+            "layout", "logs"
+        ):
+            folder_path = root / folder
+            folder_path.mkdir(parents=True, exist_ok=True)
+            (folder_path / ".keep").write_text("", encoding="utf-8")
+        (root / "verilog" / "design.v").write_text("", encoding="utf-8")
+        (root / "verilog" / "testbench.v").write_text("", encoding="utf-8")
+        metadata = {"format": "EDA2", "format_version": 2, "project_name": self.PP.stem if self.PP else "untitled"}
+        (root / "project.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    def start_project_workspace(self):
+        if self.project_tempdir is not None:
+            self.project_tempdir.cleanup()
+        self.project_tempdir = tempfile.TemporaryDirectory(prefix="eda2_project_")
+        self.project_dir = Path(self.project_tempdir.name)
+        self.waveform_path = self.project_dir / "simulation" / "waveform.vcd"
+    def sync_editors_to_project(self):
+        if self.project_dir is None or self.verilog_editor is None or self.testbench_editor is None:
+            return
+        verilog_dir = self.project_dir / "verilog"
+        verilog_dir.mkdir(parents=True, exist_ok=True)
+        (verilog_dir / "design.v").write_text(self.verilog_editor.get("1.0", "end-1c"), encoding="utf-8")
+        (verilog_dir / "testbench.v").write_text(self.testbench_editor.get("1.0", "end-1c"), encoding="utf-8")
+    def pack_project(self):
+        if self.PP is None or self.project_dir is None:
+            return False
+        self.sync_editors_to_project()
+        metadata_path = self.project_dir / "project.json"
+        metadata = {"format": "EDA2", "format_version": 2, "project_name": self.PP.stem}
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        self.PP.parent.mkdir(parents=True, exist_ok=True)
+        temp_archive = self.PP.with_name(self.PP.name + ".tmp")
+        try:
+            with zipfile.ZipFile(temp_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for item in self.project_dir.rglob("*"):
+                    if item.is_file():
+                        archive.write(item, item.relative_to(self.project_dir).as_posix())
+            os.replace(temp_archive, self.PP)
+            return True
+        except OSError:
+            temp_archive.unlink(missing_ok=True)
+            raise
+    def close_app(self):
+        if self.PP is not None and self.project_dir is not None:
+            if messagebox.askyesno("save project", "Save all project files into the .eda2 archive before closing?"):
+                try:
+                    self.pack_project()
+                except OSError as e:
+                    messagebox.showerror("save failed", str(e))
+                    return
+        if self.project_tempdir is not None:
+            self.project_tempdir.cleanup()
+        self.destroy()
     def delete(self):
         for child in self.winfo_children():
             child.destroy()
@@ -57,23 +122,77 @@ class eda(tk.Tk):
         tk.Button(box, text="new project", font=(arial, 14), width=24, height=3, command=self.newproject).pack(pady=5)
         tk.Button(box, text="open existing project", font=(arial, 14), width=24, height=3, command=self.openexistingproject).pack(pady=5)
     def newproject(self):
-        self.PP = None
-        self.waveform_path = self.default_waveform_path()
-        self.showeditor(var1, var2)
-    def openexistingproject(self):
-        filepath = filedialog.askopenfilename(title="open project", filetypes=[("integrated vlsi platform rev1.3 (27/10/2026)", f"*{filetype}"), ("JSON Files", "*.json"), ("All Files", "*.*")])
+        filepath = filedialog.asksaveasfilename(
+            title="create EDA2 project", defaultextension=filetype,
+            initialdir=str(self.projects_dir), initialfile=f"new_project{filetype}",
+            filetypes=[("EDA2 project", f"*{filetype}")]
+        )
         if not filepath:
             return
-        try:
-            data = json.loads(Path(filepath).read_text(encoding="utf-8"))
-            vcode, tbcode = data.get("verilog", ""), data.get("testbench", "")
-        except (OSError, json.JSONDecodeError) as e:
-            messagebox.showerror("open failed", f"error code {e}")
-            return
         self.PP = Path(filepath)
-        self.waveform_path = self.PP.parent / "waveform.vcd"
+        self.start_project_workspace()
+        self.create_project_structure(self.project_dir)
+        self.waveform_path = self.default_waveform_path()
+        self.showeditor("", "")
+        try:
+            self.pack_project()
+            self.consoleprint(f"Created project archive: {self.PP}\n")
+        except OSError as e:
+            messagebox.showerror("project creation failed", str(e))
+    def openexistingproject(self):
+        filepath = filedialog.askopenfilename(
+            title="open project", initialdir=str(self.projects_dir),
+            filetypes=[("EDA2 project", f"*{filetype}"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+        project_path = Path(filepath)
+        self.PP = project_path
+        self.start_project_workspace()
+        try:
+            if zipfile.is_zipfile(project_path):
+                with zipfile.ZipFile(project_path, "r") as archive:
+                    for member in archive.infolist():
+                        target = (self.project_dir / member.filename).resolve()
+                        if self.project_dir.resolve() not in target.parents and target != self.project_dir.resolve():
+                            raise ValueError("Project archive contains an unsafe file path.")
+                    archive.extractall(self.project_dir)
+                design_path = self.project_dir / "verilog" / "design.v"
+                testbench_path = self.project_dir / "verilog" / "testbench.v"
+                vcode = design_path.read_text(encoding="utf-8") if design_path.is_file() else ""
+                tbcode = testbench_path.read_text(encoding="utf-8") if testbench_path.is_file() else ""
+            else:
+                # Import projects created by the older JSON-based EDA2 versions.
+                data = json.loads(project_path.read_text(encoding="utf-8"))
+                vcode, tbcode = data.get("verilog", ""), data.get("testbench", "")
+                self.create_project_structure(self.project_dir)
+                (self.project_dir / "verilog" / "design.v").write_text(vcode, encoding="utf-8")
+                (self.project_dir / "verilog" / "testbench.v").write_text(tbcode, encoding="utf-8")
+        except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as e:
+            if self.project_tempdir is not None:
+                self.project_tempdir.cleanup()
+            self.project_tempdir = self.project_dir = None
+            self.PP = None
+            messagebox.showerror("open failed", f"Could not open EDA2 project: {e}")
+            return
+        self.waveform_path = self.default_waveform_path()
         self.showeditor(vcode, tbcode)
-        self.consoleprint(f"opened {filepath}\n")
+        self.consoleprint(f"Opened project archive: {filepath}\n")
+    def saveproject(self):
+        if self.PP is None:
+            filepath = filedialog.asksaveasfilename(
+                title="save EDA2 project", defaultextension=filetype,
+                initialdir=str(self.projects_dir), initialfile=f"new_project{filetype}",
+                filetypes=[("EDA2 project", f"*{filetype}")]
+            )
+            if not filepath:
+                return
+            self.PP = Path(filepath)
+        try:
+            if self.pack_project():
+                self.consoleprint(f"Saved complete project archive: {self.PP}\n")
+        except OSError as e:
+            messagebox.showerror("save failed", f"Could not save project archive: {e}")
     def showeditor(self, vcode, tbcode):
         self.delete()
         toolbar = tk.Frame(self, padx=10, pady=8, bg="#f2f2f2")
@@ -109,93 +228,166 @@ class eda(tk.Tk):
         return {"frame": frame, "editor": editor}
     def projectlabel(self):
         return f"project- {self.PP.name}" if self.PP else "project- untitled"
-    def saveproject(self):
-        if self.PP is None:
-            filepath = filedialog.asksaveasfilename(title="save project", defaultextension=filetype, filetypes=[("integrated vlsi platform rev1.3 (27/10/2026)", f"*{filetype}"), ("JSON Files", "*.json"), ("All Files", "*.*")])
-            if not filepath:
-                return
-            self.PP = Path(filepath)
-            self.waveform_path = self.PP.parent / "waveform.vcd"
-        try:
-            self.PP.write_text(json.dumps({"version": 1.3, "verilog": self.verilog_editor.get("1.0", "end-1c"), "testbench": self.testbench_editor.get("1.0", "end-1c")}, indent=2), encoding="utf-8")
-        except OSError as e:
-            messagebox.showerror("save failed", f"error code {e}")
-            return
-        self.consoleprint(f"saved {self.PP}\n")
+    def find_oss_cad_suite(self):
+        """Find the OSS CAD Suite root without relying on the process PATH."""
+        app_dir = Path(__file__).resolve().parent
+        desktop = Path.home() / "Desktop"
+        search_roots = [
+            self.dependencies_dir / "yosys",
+            self.dependencies_dir,
+            app_dir / "yosys",
+            desktop / "eda2 dependencies" / "yosys",
+            desktop / "yosys",
+        ]
+        for root in search_roots:
+            if (root / "bin" / "yosys.exe").is_file():
+                return root
+            if root.is_dir():
+                for candidate in root.glob("oss-cad-suite*/oss-cad-suite"):
+                    if (candidate / "bin" / "yosys.exe").is_file():
+                        return candidate
+                # Also support a directly extracted suite folder.
+                for candidate in root.glob("oss-cad-suite*"):
+                    if (candidate / "bin" / "yosys.exe").is_file():
+                        return candidate
+        return None
+
+    def tool_environment(self):
+        """Return a child-process environment with EDA2's bundled tools on PATH."""
+        env = os.environ.copy()
+        app_dir = Path(__file__).resolve().parent
+        desktop = Path.home() / "Desktop"
+        tool_dirs = []
+
+        # Standalone Icarus installation used on this machine.
+        # The actual path is: Desktop\eda2dependencies\icarus\iverilog\bin
+        icarus_bases = (
+            self.dependencies_dir / "icarus",
+            self.dependencies_dir / "iverilog",
+            self.dependencies_dir / "icarus" / "iverilog",
+            app_dir / "icarus",
+            desktop / "eda2dependencies" / "icarus" / "iverilog",
+            desktop / "eda2 dependencies" / "icarus" / "iverilog",
+            desktop / "eda2 dependencies" / "icarus",
+        )
+        for base in icarus_bases:
+            for candidate in (base / "bin", base):
+                if candidate.is_dir():
+                    tool_dirs.append(candidate)
+
+        suite = self.find_oss_cad_suite()
+        if suite is not None:
+            self.oss_cad_suite = suite
+            for candidate in (suite / "bin", suite / "lib", suite / "mingw64" / "bin", suite):
+                if candidate.is_dir():
+                    tool_dirs.append(candidate)
+
+        # Remove duplicates while preserving order. Windows PATH entries with
+        # spaces are valid as-is; quoting PATH entries would be incorrect.
+        unique_dirs = []
+        seen = set()
+        for directory in tool_dirs:
+            value = str(directory.resolve())
+            key = os.path.normcase(value)
+            if key not in seen:
+                seen.add(key)
+                unique_dirs.append(value)
+        existing = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(unique_dirs + ([existing] if existing else []))
+        return env, unique_dirs, suite
+
+    def find_icarus_executable(self, name, env_dirs):
+        executable = name + (".exe" if os.name == "nt" else "")
+        for directory in env_dirs:
+            candidate = Path(directory) / executable
+            if candidate.is_file():
+                return str(candidate)
+        return shutil.which(name)
+
     def runproject(self):
-        self.consoleprint("compiling verilog\n")
+        if self.project_dir is None:
+            messagebox.showwarning("no project", "Create or open an EDA2 project first.")
+            return
+        self.consoleprint("compiling Verilog from active project\n")
         try:
-            with tempfile.TemporaryDirectory(prefix="eda2_") as tempdir:
-                temppath = Path(tempdir)
-                verilogpath = temppath / "design.v"
-                testbenchpath = temppath / "testbench.v"
-                outputpath = temppath / "output.vvp"
-                vcode = self.verilog_editor.get("1.0", "end-1c")
-                tbcode = self.testbench_editor.get("1.0", "end-1c")
-                self.waveform_path.parent.mkdir(parents=True, exist_ok=True)
-                self.waveform_path.unlink(missing_ok=True)
-                # Ensure the testbench writes its VCD directly to the persistent waveform path.
-                dumpfile_pattern = r'\$dumpfile\s*\(\s*"[^"]+"\s*\)'
-                dumpfile_call = f'$dumpfile("{self.waveform_path.as_posix()}")'
-                if re.search(dumpfile_pattern, tbcode):
-                    tbcode = re.sub(dumpfile_pattern, dumpfile_call, tbcode, count=1)
-                else:
-                    module_match = re.search(r"\bmodule\s+(?:automatic\s+|static\s+)?([A-Za-z_]\w*)\b", tbcode)
-                    if module_match is None:
-                        self.consoleprint("could not identify a testbench module for waveform generation\n")
-                        self.consoleprint("add a testbench module so EDA2 can inject waveform commands\n")
-                        return
-                    endmodule_match = re.search(r"\bendmodule\b", tbcode[module_match.end():])
-                    if endmodule_match is None:
-                        self.consoleprint("could not find endmodule in testbench\n")
-                        return
-                    insert_pos = module_match.end() + endmodule_match.start()
-                    module_name = module_match.group(1)
-                    waveform_code = f'\ninitial begin\n    $dumpfile("{self.waveform_path.as_posix()}");\n'
-                    if not re.search(r"\$dumpvars\s*\(", tbcode):
-                        waveform_code += f"    $dumpvars(0, {module_name});\n"
-                    waveform_code += "end\n\n"
-                    tbcode = tbcode[:insert_pos] + waveform_code + tbcode[insert_pos:]
+            self.sync_editors_to_project()
+            simulation_dir = self.project_dir / "simulation"
+            simulation_dir.mkdir(parents=True, exist_ok=True)
+            verilogpath = self.project_dir / "verilog" / "design.v"
+            testbenchpath = self.project_dir / "verilog" / "testbench.v"
+            outputpath = simulation_dir / "output.vvp"
+            vcode = verilogpath.read_text(encoding="utf-8")
+            tbcode = testbenchpath.read_text(encoding="utf-8")
+            self.waveform_path.parent.mkdir(parents=True, exist_ok=True)
+            self.waveform_path.unlink(missing_ok=True)
+            dumpfile_pattern = r'\$dumpfile\s*\(\s*"[^"]+"\s*\)'
+            dumpfile_call = f'$dumpfile("{self.waveform_path.as_posix()}")'
+            if re.search(dumpfile_pattern, tbcode):
+                tbcode = re.sub(dumpfile_pattern, dumpfile_call, tbcode, count=1)
+            else:
+                module_match = re.search(r"\bmodule\s+(?:automatic\s+|static\s+)?([A-Za-z_]\w*)\b", tbcode)
+                if module_match is None:
+                    self.consoleprint("could not identify a testbench module for waveform generation\n")
+                    self.consoleprint("add a testbench module so EDA2 can inject waveform commands\n")
+                    return
+                endmodule_match = re.search(r"\bendmodule\b", tbcode[module_match.end():])
+                if endmodule_match is None:
+                    self.consoleprint("could not find endmodule in testbench\n")
+                    return
+                insert_pos = module_match.end() + endmodule_match.start()
+                module_name = module_match.group(1)
+                waveform_code = f'\ninitial begin\n    $dumpfile("{self.waveform_path.as_posix()}");\n'
                 if not re.search(r"\$dumpvars\s*\(", tbcode):
-                    module_match = re.search(r"\bmodule\s+(?:automatic\s+|static\s+)?([A-Za-z_]\w*)\b", tbcode)
-                    if module_match:
-                        module_name = module_match.group(1)
-                        endmodule_match = re.search(r"\bendmodule\b", tbcode[module_match.end():])
-                        if endmodule_match:
-                            insert_pos = module_match.end() + endmodule_match.start()
-                            tbcode = tbcode[:insert_pos] + f"\ninitial begin\n    $dumpvars(0, {module_name});\nend\n\n" + tbcode[insert_pos:]
-                verilogpath.write_text(vcode, encoding="utf-8")
-                testbenchpath.write_text(tbcode, encoding="utf-8")
-                suite_root = self.yosys_start_bat.parent
-                env = os.environ.copy()
-                compiler = "iverilog"
-                simulator = "vvp"
-                if self.yosys_start_bat.is_file():
-                    suite_bin = suite_root / "bin"
-                    env["PATH"] = str(suite_bin) + os.pathsep + str(suite_root / "lib") + os.pathsep + env.get("PATH", "")
-                    if (suite_bin / "iverilog.exe").is_file():
-                        compiler = str(suite_bin / "iverilog.exe")
-                    if (suite_bin / "vvp.exe").is_file():
-                        simulator = str(suite_bin / "vvp.exe")
-                compileresult = self.commandrun(
-                    [compiler, "-g2012", "-o", str(outputpath), str(testbenchpath), str(verilogpath)],
-                    cwd=temppath, env=env
+                    waveform_code += f"    $dumpvars(0, {module_name});\n"
+                waveform_code += "end\n\n"
+                tbcode = tbcode[:insert_pos] + waveform_code + tbcode[insert_pos:]
+            if not re.search(r"\$dumpvars\s*\(", tbcode):
+                module_match = re.search(r"\bmodule\s+(?:automatic\s+|static\s+)?([A-Za-z_]\w*)\b", tbcode)
+                if module_match:
+                    module_name = module_match.group(1)
+                    endmodule_match = re.search(r"\bendmodule\b", tbcode[module_match.end():])
+                    if endmodule_match:
+                        insert_pos = module_match.end() + endmodule_match.start()
+                        tbcode = tbcode[:insert_pos] + f"\ninitial begin\n    $dumpvars(0, {module_name});\nend\n\n" + tbcode[insert_pos:]
+            # Use a generated simulation copy; the user's testbench source remains unchanged.
+            simulation_tb = simulation_dir / "testbench_runtime.v"
+            simulation_tb.write_text(tbcode, encoding="utf-8")
+            env, tool_dirs, suite_root = self.tool_environment()
+            compiler = self.find_icarus_executable("iverilog", tool_dirs)
+            simulator = self.find_icarus_executable("vvp", tool_dirs)
+            self.consoleprint("Tool PATH entries for this run:\n")
+            for directory in tool_dirs:
+                self.consoleprint(f"  {directory}\n")
+            if compiler is None or simulator is None:
+                self.consoleprint("Icarus Verilog was not found. Checked Desktop/eda2dependencies/icarus/iverilog/bin, EDA2/dependencies/icarus, and OSS CAD Suite.\n")
+                messagebox.showerror(
+                    "Icarus Verilog not found",
+                    "Could not find iverilog.exe and vvp.exe.\n\n"
+                    "Expected Desktop/eda2dependencies/icarus/iverilog/bin, dependencies/icarus/bin, or the OSS CAD Suite bin folder.\n"
+                    "Check that both executables exist in the same installation."
                 )
-                if compileresult is None or compileresult.returncode != 0:
-                    self.consoleprint("compilation failed\n")
-                    if compileresult is not None:
-                        self.processoutput(compileresult)
-                    return
-                self.consoleprint("compilation successful, running simulation\n")
-                simresult = self.commandrun([simulator, str(outputpath)], cwd=temppath, env=env)
-                if simresult is None:
-                    return
-                self.processoutput(simresult)
-                if self.waveform_path.is_file():
-                    self.consoleprint(f"waveform generated: {self.waveform_path}\n")
-                else:
-                    self.consoleprint("simulation did not generate a waveform file; check the testbench\n")
-                self.consoleprint("simulation successful\n" if simresult.returncode == 0 else "simulation failed\n")
+                return
+            compileresult = self.commandrun(
+                [compiler, "-g2012", "-o", str(outputpath), str(simulation_tb), str(verilogpath)],
+                cwd=simulation_dir, env=env
+            )
+            if compileresult is None or compileresult.returncode != 0:
+                self.consoleprint("compilation failed\n")
+                if compileresult is not None:
+                    self.processoutput(compileresult)
+                self.pack_project()
+                return
+            self.consoleprint("compilation successful, running simulation\n")
+            simresult = self.commandrun([simulator, str(outputpath)], cwd=simulation_dir, env=env)
+            if simresult is None:
+                return
+            self.processoutput(simresult)
+            if self.waveform_path.is_file():
+                self.consoleprint(f"waveform generated inside project: simulation/waveform.vcd\n")
+            else:
+                self.consoleprint("simulation did not generate a waveform file; check the testbench\n")
+            self.consoleprint("simulation successful\n" if simresult.returncode == 0 else "simulation failed\n")
+            self.pack_project()
         except OSError as e:
             self.consoleprint(f"simulation error: {e}\n")
     def commandrun(self, command, cwd=None, env=None):
@@ -207,8 +399,27 @@ class eda(tk.Tk):
         except OSError as e:
             self.consoleprint(f"could not execute {command[0]}: {e}\n")
             return subprocess.CompletedProcess(command, returncode=1, stdout="", stderr="")
+    def find_gtkwave_executable(self):
+        """Find GTKWave in EDA2's shared dependencies before checking PATH."""
+        executable = "gtkwave.exe" if os.name == "nt" else "gtkwave"
+        search_roots = (
+            self.dependencies_dir / "gtkwave",
+            self.dependencies_dir,
+        )
+        for root in search_roots:
+            if not root.is_dir():
+                continue
+            direct = root / executable
+            if direct.is_file():
+                return direct
+            for candidate in root.rglob(executable):
+                if candidate.is_file():
+                    return candidate
+        located = shutil.which("gtkwave")
+        return Path(located) if located else None
+
     def open_waveform(self):
-        #use the latest generated waveform by default; allow selecting another vcd file if needed
+        # Use the latest generated waveform by default; allow selecting another VCD if needed.
         if self.waveform_path is not None and self.waveform_path.is_file():
             waveform = self.waveform_path
         else:
@@ -220,6 +431,8 @@ class eda(tk.Tk):
             if not filepath:
                 return
             waveform = Path(filepath)
+        if self.gtkwave_path is None:
+            self.gtkwave_path = self.find_gtkwave_executable()
         command = [str(self.gtkwave_path), str(waveform)] if self.gtkwave_path else ["gtkwave", str(waveform)]
         try:
             subprocess.Popen(command)
@@ -254,8 +467,20 @@ class eda(tk.Tk):
             self.OC.insert("end", text)
             self.OC.see("end")
     def homeconfirm(self):
-        if messagebox.askyesno("return home", "return to start page? unsaved changes will be lost if not saved"):
-            self.projectpage()
+        if not messagebox.askyesno("return home", "Return to start page? The current project will be saved into its .eda2 archive."):
+            return
+        try:
+            if self.PP is not None:
+                self.pack_project()
+        except OSError as e:
+            messagebox.showerror("save failed", str(e))
+            return
+        if self.project_tempdir is not None:
+            self.project_tempdir.cleanup()
+        self.project_tempdir = self.project_dir = None
+        self.PP = None
+        self.waveform_path = None
+        self.projectpage()
     def detect_top_modules(self, verilog_code):
         # Basic heuristic: declared modules not instantiated by another module are likely tops.
         module_pattern = re.compile(
@@ -317,25 +542,34 @@ class eda(tk.Tk):
         ):
             messagebox.showerror("module not found", f'The RTL does not declare a module named "{top}".')
             return
-        suite_root = self.yosys_start_bat.parent
-        if not self.yosys_start_bat.is_file():
+        env, tool_dirs, suite_root = self.tool_environment()
+        if suite_root is None:
             selected = filedialog.askopenfilename(
-                title="Locate OSS CAD Suite start.bat",
+                title="Locate yosys.exe",
                 initialdir=str(Path.home() / "Desktop"),
-                filetypes=[("OSS CAD Suite launcher", "start.bat"), ("Batch files", "*.bat"), ("All files", "*.*")]
+                filetypes=[("Yosys executable", "yosys.exe"), ("Executable files", "*.exe"), ("All files", "*.*")]
             )
             if not selected:
-                self.consoleprint("Yosys not started: OSS CAD Suite start.bat was not selected.\n")
+                self.consoleprint("Yosys not started: yosys.exe was not selected.\n")
                 return
-            self.yosys_start_bat = Path(selected)
-            suite_root = self.yosys_start_bat.parent
-        yosys_exe = suite_root / "bin" / "yosys.exe"
+            yosys_exe = Path(selected)
+            suite_root = yosys_exe.parent.parent
+            for candidate in (suite_root / "bin", suite_root / "lib", suite_root / "mingw64" / "bin", suite_root):
+                if candidate.is_dir() and str(candidate.resolve()) not in tool_dirs:
+                    tool_dirs.append(str(candidate.resolve()))
+            env["PATH"] = os.pathsep.join(tool_dirs + [env.get("PATH", "")])
+        else:
+            yosys_exe = suite_root / "bin" / "yosys.exe"
         if not yosys_exe.is_file():
             messagebox.showerror("Yosys executable not found", f"Could not find yosys.exe at {yosys_exe}")
             return
-        output_dir = self.PP.parent if self.PP else Path(__file__).resolve().parent
+        if self.project_dir is None:
+            messagebox.showwarning("no project", "Create or open an EDA2 project first.")
+            return
+        self.sync_editors_to_project()
+        output_dir = self.project_dir / "synthesis"
         output_dir.mkdir(parents=True, exist_ok=True)
-        netlist_path = output_dir / f"synthesized_{top}.v"
+        netlist_path = output_dir / f"generic_netlist_{top}.v"
         self.consoleprint(f"Starting Yosys synthesis for top module: {top}\n")
         self.consoleprint(f"Output netlist: {netlist_path}\n")
         try:
@@ -345,12 +579,6 @@ class eda(tk.Tk):
                 yosys_script = (
                     f"read_verilog design.v; hierarchy -check -top {top}; "
                     f"synth -top {top}; stat; write_verilog synthesized.v"
-                )
-                env = os.environ.copy()
-                env["PATH"] = (
-                    str(suite_root / "bin") + os.pathsep +
-                    str(suite_root / "lib") + os.pathsep +
-                    env.get("PATH", "")
                 )
                 result = subprocess.run(
                     [str(yosys_exe), "-p", yosys_script],
@@ -363,7 +591,8 @@ class eda(tk.Tk):
                         generated.read_text(encoding="utf-8", errors="replace"),
                         encoding="utf-8"
                     )
-                    self.consoleprint(f"Yosys synthesis successful. Netlist saved to: {netlist_path}\n")
+                    self.consoleprint(f"Yosys synthesis successful. Netlist saved inside project: synthesis/{netlist_path.name}\n")
+                    self.pack_project()
                 else:
                     self.consoleprint(f"Yosys synthesis failed (exit code {result.returncode}).\n")
         except OSError as e:
