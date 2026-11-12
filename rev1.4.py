@@ -2,7 +2,7 @@
 #
 # kushagra srivastava (hostilebaker on github)
 #
-# integrated vlsi platform rev 1.3 (27/10/2026) (start date:-17/06/2026)
+# integrated vlsi platform rev 1.4 (27/10/2026) (start date:-17/06/2026)
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose is hereby granted, provided that the above
