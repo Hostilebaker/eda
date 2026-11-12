@@ -78,12 +78,25 @@ class eda(tk.Tk):
         self.waveform_path = self.project_dir / "simulation" / "waveform.vcd"
 
     def sync_editors_to_project(self):
-        if self.project_dir is None or self.verilog_editor is None or self.testbench_editor is None:
+        if self.project_dir is None:
             return
         verilog_dir = self.project_dir / "verilog"
         verilog_dir.mkdir(parents=True, exist_ok=True)
-        (verilog_dir / "design.v").write_text(self.verilog_editor.get("1.0", "end-1c"), encoding="utf-8")
-        (verilog_dir / "testbench.v").write_text(self.testbench_editor.get("1.0", "end-1c"), encoding="utf-8")
+        # A project-page transition can destroy editor widgets while callbacks
+        # are still unwinding. Never call Tcl on a destroyed Text widget.
+        try:
+            if self.verilog_editor is not None and self.verilog_editor.winfo_exists():
+                (verilog_dir / "design.v").write_text(
+                    self.verilog_editor.get("1.0", "end-1c"), encoding="utf-8"
+                )
+            if self.testbench_editor is not None and self.testbench_editor.winfo_exists():
+                (verilog_dir / "testbench.v").write_text(
+                    self.testbench_editor.get("1.0", "end-1c"), encoding="utf-8"
+                )
+        except tk.TclError:
+            # The widget was destroyed between the existence check and get().
+            # The project files remain intact; callers save before switching.
+            return
 
     def pack_project(self):
         # Kept under its old method name so existing button/tool callbacks remain intact.
@@ -107,13 +120,16 @@ class eda(tk.Tk):
             if messagebox.askyesno("save project", "Save the current Verilog files and project metadata before closing?"):
                 try:
                     self.pack_project()
-                except OSError as e:
+                except (OSError, tk.TclError) as e:
                     messagebox.showerror("save failed", str(e))
                     return
         self.destroy()
     def delete(self):
         for child in self.winfo_children():
             child.destroy()
+        # Clear references so later save/close callbacks cannot use dead widgets.
+        self.verilog_editor = None
+        self.testbench_editor = None
         self.OC = None
     def projectpage(self):
         self.delete()
@@ -130,6 +146,13 @@ class eda(tk.Tk):
             filetypes=[("EDA2 project", f"*{filetype}")]
         )
         if not filepath:
+            return
+        # Save the currently open project before changing the active project paths.
+        try:
+            if self.PP is not None and self.project_dir is not None:
+                self.pack_project()
+        except (OSError, tk.TclError) as e:
+            messagebox.showerror("save failed", str(e))
             return
         requested_path = Path(filepath).resolve()
         project_name = requested_path.stem
@@ -168,6 +191,10 @@ class eda(tk.Tk):
             if not selected_path.is_file() or selected_path.suffix.lower() != filetype:
                 raise ValueError("Select a valid .eda2 project file.")
 
+            # Save the old project while its editor widgets and paths are still active.
+            if self.PP is not None and self.project_dir is not None:
+                self.pack_project()
+
             # Legacy ZIP-based projects are imported into a same-named project folder.
             if zipfile.is_zipfile(selected_path):
                 project_dir = self.projects_dir / selected_path.stem
@@ -187,7 +214,6 @@ class eda(tk.Tk):
                 testbench_path = project_dir / "verilog" / "testbench.v"
                 vcode = design_path.read_text(encoding="utf-8") if design_path.is_file() else ""
                 tbcode = testbench_path.read_text(encoding="utf-8") if testbench_path.is_file() else ""
-                self.pack_project()
             else:
                 project_dir = selected_path.parent
                 self.project_dir = project_dir
@@ -204,14 +230,19 @@ class eda(tk.Tk):
                     (project_dir / "verilog" / "testbench.v").write_text(data.get("testbench", ""), encoding="utf-8")
                 vcode = (project_dir / "verilog" / "design.v").read_text(encoding="utf-8")
                 tbcode = (project_dir / "verilog" / "testbench.v").read_text(encoding="utf-8")
-                self.pack_project()
-        except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as e:
+        except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError, tk.TclError) as e:
             self.project_dir = None
             self.PP = None
             messagebox.showerror("open failed", f"Could not open EDA2 project: {e}")
             return
         self.waveform_path = self.default_waveform_path()
         self.showeditor(vcode, tbcode)
+        # Save metadata only after the new project's editors are installed.
+        try:
+            self.pack_project()
+        except (OSError, tk.TclError) as e:
+            messagebox.showerror("save failed", str(e))
+            return
         self.consoleprint(f"Opened project folder: {self.project_dir}\n")
         self.consoleprint(f"Project file: {self.PP}\n")
 
@@ -536,7 +567,7 @@ class eda(tk.Tk):
         try:
             if self.PP is not None:
                 self.pack_project()
-        except OSError as e:
+        except (OSError, tk.TclError) as e:
             messagebox.showerror("save failed", str(e))
             return
         self.project_dir = None
