@@ -711,11 +711,11 @@ class eda(tk.Tk):
                 # when the EDA installation path contains spaces.
                 launcher_path = output_dir / "run_yosys.cmd"
                 launcher_path.write_text(
-                    "@echo off\\r\\n"
-                    f'call "{environment_bat}"\\r\\n'
-                    "if errorlevel 1 exit /b %errorlevel%\\r\\n"
-                    f'"{yosys_exe}" -s "{script_path}"\\r\\n'
-                    "exit /b %errorlevel%\\r\\n",
+                    "@echo off\r\n"
+                    f'call "{environment_bat}"\r\n'
+                    "if errorlevel 1 exit /b %errorlevel%\r\n"
+                    f'"{yosys_exe}" -s "{script_path}"\r\n'
+                    "exit /b %errorlevel%\r\n",
                     encoding="utf-8"
                 )
                 result = subprocess.run(
@@ -769,4 +769,3 @@ class eda(tk.Tk):
 if __name__ == "__main__":
     app = eda()
     app.mainloop()
-
