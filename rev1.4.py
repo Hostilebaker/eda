@@ -1058,8 +1058,181 @@ class eda(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
         self.after(100, self.poll_yosys_queue)
 
+    def build_gate_level_dot(self, json_path, top):
+        """Build a monochrome, pin-accurate cell schematic from Yosys JSON."""
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        modules = data.get("modules", {})
+        if top not in modules:
+            raise ValueError(f"Top module '{top}' is not present in {json_path.name}.")
+        module = modules[top]
+        cells = module.get("cells", {})
+
+        def esc(value):
+            return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;").replace('"', "&quot;"))
+
+        def safe(value):
+            return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", str(value))
+
+        lines = [
+            "digraph GATE_LEVEL {",
+            ' graph [rankdir=LR, bgcolor="white", pad="0.25", nodesep="0.28", ranksep="0.65", '
+            'splines=ortho, concentrate=false, overlap=false, outputorder=edgesfirst, '
+            'fontname="Arial", labelloc=t, fontsize=18, label="' + esc(top) + '"];',
+            ' node [shape=plain, fontname="Arial", fontsize=9];',
+            ' edge [color="black", fontcolor="black", fontname="Arial", fontsize=7, '
+            'penwidth=1.0, arrowsize=0.55];'
+        ]
+
+        # Give every top-level port a real connection anchor.
+        top_ports = {}
+        for pname, port in module.get("ports", {}).items():
+            bits = [str(b) for b in port.get("bits", [])]
+            direction = port.get("direction", "input")
+            suffix = f" [{len(bits)-1}:0]" if len(bits) > 1 else ""
+            node = safe("top_" + pname)
+            port_id = safe("anchor_" + pname)
+            table = (f'<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="5" COLOR="black">'
+                     f'<TR><TD PORT="{port_id}"><B>{esc(pname + suffix)}</B></TD></TR></TABLE>')
+            lines.append(f' {node} [label=<{table}>];')
+            top_ports[pname] = (node, port_id, direction, bits)
+
+        # Each standard/generic cell is a separate rectangular symbol with named pins.
+        cell_pins = {}
+        for cname, cell in cells.items():
+            node = safe("cell_" + cname)
+            directions = cell.get("port_directions", {})
+            connections = cell.get("connections", {})
+            rows = []
+            for pname in sorted(connections):
+                direction = directions.get(pname, "inout")
+                bits = connections[pname]
+                width = len(bits)
+                suffix = f" [{width-1}:0]" if width > 1 else ""
+                anchor = safe("pin_" + pname)
+                prefix = "◀" if direction == "output" else "▶" if direction == "input" else "◆"
+                rows.append(f'<TR><TD PORT="{anchor}" ALIGN="LEFT">{prefix} {esc(pname + suffix)}</TD></TR>')
+                cell_pins[(cname, pname)] = (node, anchor, direction, [str(b) for b in bits])
+            cell_type = cell.get("type", "cell")
+            table = ('<TABLE BORDER="1" CELLBORDER="0" CELLPADDING="4" CELLSPACING="0" COLOR="black">'
+                     f'<TR><TD BGCOLOR="white"><B>{esc(cell_type)}</B></TD></TR>'
+                     + ''.join(rows) + '</TABLE>')
+            lines.append(f' {node} [label=<{table}>];')
+
+        # Collapse bit-level connections into bus edges between matching cell pins.
+        # This keeps wide datapaths readable and avoids hundreds of redundant wires.
+        bit_names = {}
+        for net_name, net in module.get("netnames", {}).items():
+            # Ignore Yosys-generated source-location names; they make unreadable wire labels.
+            if (len(net_name) > 36 or "/" in net_name or "\\" in net_name
+                    or ":" in net_name or net_name.startswith("$")):
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$\[\]]*", net_name):
+                continue
+            net_bits = net.get("bits", [])
+            for index, bit in enumerate(net_bits):
+                bit_names.setdefault(str(bit), net_name if len(net_bits) == 1 else f"{net_name}[{index}]")
+
+        drivers, sinks = {}, {}
+        for pname, (node, anchor, direction, bits) in top_ports.items():
+            target = drivers if direction == "input" else sinks if direction == "output" else None
+            if target is not None:
+                for bit in bits:
+                    target.setdefault(bit, []).append((node, anchor, pname))
+
+        for (cname, pname), (node, anchor, direction, bits) in cell_pins.items():
+            target = drivers if direction == "output" else sinks if direction == "input" else None
+            if target is not None:
+                for bit in bits:
+                    target.setdefault(bit, []).append((node, anchor, pname))
+
+        grouped_edges = {}
+        for bit in set(drivers) & set(sinks):
+            for src_node, src_pin, _ in drivers[bit]:
+                for dst_node, dst_pin, _ in sinks[bit]:
+                    if src_node == dst_node:
+                        continue
+                    key = (src_node, src_pin, dst_node, dst_pin)
+                    grouped_edges.setdefault(key, set()).add(bit_names.get(bit, ""))
+
+        for (src_node, src_pin, dst_node, dst_pin), labels in grouped_edges.items():
+            src = f"{src_node}:{src_pin}:e" if src_pin else src_node
+            dst = f"{dst_node}:{dst_pin}:w" if dst_pin else dst_node
+            clean_labels = sorted(label for label in labels if label)
+            if len(clean_labels) == 1:
+                label = clean_labels[0]
+            elif len(clean_labels) > 1:
+                label = f"{len(clean_labels)}-bit bus"
+            else:
+                label = ""
+            label_attr = f', xlabel="{esc(label)}"' if label else ""
+            lines.append(f" {src} -> {dst} [arrowhead=normal{label_attr}];")
+
+        # Put primary inputs/outputs at the outside edges of the cell network.
+        input_ids = [safe("top_" + n) for n, (_, _, d, _) in top_ports.items() if d == "input"]
+        output_ids = [safe("top_" + n) for n, (_, _, d, _) in top_ports.items() if d == "output"]
+        if input_ids:
+            lines.append('{ rank=source; ' + '; '.join(input_ids) + '; }')
+        if output_ids:
+            lines.append('{ rank=sink; ' + '; '.join(output_ids) + '; }')
+        lines.append('}')
+        return "\n".join(lines)
+
     def generate_gate_level_schematic(self):
-        self.generate_json_schematic("gate")
+        """Render every cell from synthesized.json in a monochrome schematic."""
+        if self.project_dir is None:
+            messagebox.showwarning("no project", "Create or open an EDA2 project first.")
+            return
+        if self.yosys_running:
+            messagebox.showinfo("EDA tool running", "A Yosys/Graphviz operation is already running. Please wait for it to finish.")
+            return
+        json_path = self.project_dir / "synthesis" / "synthesized.json"
+        if not json_path.is_file():
+            messagebox.showerror("Gate-level JSON not found", f"Could not find {json_path}. Run synthesis first.")
+            return
+        top = self.find_json_top_module(json_path)
+        top_file = self.project_dir / "synthesis" / "top_module.txt"
+        if top_file.is_file():
+            try:
+                top = top_file.read_text(encoding="utf-8").strip() or top
+            except OSError:
+                pass
+        if not top:
+            messagebox.showerror("Top module not identified", "EDA2 could not identify a unique top module in synthesized.json.")
+            return
+        env, tool_dirs, suite_root = self.tool_environment()
+        graphviz_exe = self.find_icarus_executable("dot", tool_dirs)
+        if graphviz_exe is None:
+            messagebox.showerror("Graphviz not found", "Could not find dot.exe under EDA/dependencies.")
+            return
+        schematic_dir = self.project_dir / "schematic"
+        schematic_dir.mkdir(parents=True, exist_ok=True)
+        dot_path = schematic_dir / "gate_level_schematic.dot"
+        svg_path = schematic_dir / "gate_level_schematic.svg"
+        try:
+            dot_path.write_text(self.build_gate_level_dot(json_path, top), encoding="utf-8")
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Gate-level schematic error", f"Could not build the cell schematic: {exc}")
+            return
+        self.yosys_running = True
+        self.consoleprint(f"Generating monochrome gate-level schematic from {json_path.name}...\n")
+        self.consoleprint(f"Top module: {top}\n")
+        self.consoleprint("Every cell is shown individually; wires and symbols are black on white.\n")
+
+        def worker():
+            try:
+                result = subprocess.run([graphviz_exe, "-Tsvg", str(dot_path), "-o", str(svg_path)],
+                                        cwd=schematic_dir, env=env, capture_output=True, text=True)
+                self.yosys_queue.put(("graphviz", result.stdout, result.stderr, result.returncode))
+                if result.returncode != 0 or not svg_path.is_file() or svg_path.stat().st_size == 0:
+                    self.yosys_queue.put(("done", False, "Graphviz failed to create the gate-level schematic."))
+                else:
+                    self.yosys_queue.put(("done", True, "Monochrome gate-level schematic created: schematic/gate_level_schematic.svg"))
+            except Exception as exc:
+                self.yosys_queue.put(("done", False, f"Gate-level schematic generation error: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, self.poll_yosys_queue)
 
     def generate_json_schematic(self, schematic_type):
         """Render an existing Yosys JSON file through Yosys show and Graphviz."""
